@@ -1,0 +1,60 @@
+# --- Data & model artifacts (tracked by DVC later, never by git) ---
+# Leading slash anchors these to the repo root. Without it, `data/` would also
+# match the src/data/ source package and silently drop it from version control.
+/data/
+/models/
+/reports/
+*.parquet
+*.csv
+*.csv.gz
+*.zip
+*.pkl
+*.joblib
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- MLflow (local tracking store) ---
+mlruns/
+mlartifacts/
+
+# --- Secrets & local config ---
+.env
+.env.*
+!.env.example
+kaggle.json
+*.pem
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

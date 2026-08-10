@@ -1,0 +1,16 @@
+# Normalise line endings: this repo moves between Windows and Colab/Linux.
+# Without this, every file round-tripped through Colab shows up as fully
+# rewritten in the diff.
+* text=auto eol=lf
+
+# Notebooks are JSON — keep them diffable and never CRLF-mangled.
+*.ipynb text eol=lf
+
+# Binary artifacts: never touch.
+*.parquet binary
+*.pkl     binary
+*.joblib  binary
+*.png     binary
+*.jpg     binary
+*.zip     binary
+*.gz      binary

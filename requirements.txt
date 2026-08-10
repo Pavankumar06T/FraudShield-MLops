@@ -1,0 +1,19 @@
+# FraudShield MLOps — core dependencies
+#
+# Floors only, no ceilings: `pip freeze > requirements.lock.txt` after install
+# for the reproducible pin. Later phases add evidently, mlflow, fastapi,
+# kafka-python, psycopg2, and dvc — kept out until the drift notebook proves
+# the premise (see memory: fraudshield-dataset-decision).
+
+# --- Data handling ---
+pandas>=2.2
+numpy>=1.26
+pyarrow>=15.0
+
+# --- Modelling ---
+scikit-learn>=1.4
+xgboost>=2.0
+lightgbm>=4.3
+
+# --- Explainability ---
+shap>=0.45

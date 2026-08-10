@@ -17,3 +17,6 @@ lightgbm>=4.3
 
 # --- Explainability ---
 shap>=0.45
+
+# --- Testing ---
+pytest>=8.0

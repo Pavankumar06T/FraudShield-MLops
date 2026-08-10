@@ -195,17 +195,31 @@ class SplitBoundaries:
             )
 
 
-def _require(manifest: dict, key: str) -> float:
+def _dig(manifest: dict, *keys: str) -> object:
+    """Walk a nested manifest path, naming what was found on failure."""
+    node: object = manifest
+    for depth, key in enumerate(keys):
+        if not isinstance(node, dict):
+            raise TypeError(
+                f"{SPLIT_MANIFEST_PATH}: expected an object at "
+                f"{'.'.join(keys[:depth]) or '<root>'}, got {type(node).__name__}."
+            )
+        if key not in node:
+            raise KeyError(
+                f"{SPLIT_MANIFEST_PATH}: missing required key "
+                f"{'.'.join(keys[: depth + 1])!r}. "
+                f"Keys present at {'.'.join(keys[:depth]) or '<root>'}: {sorted(node)}"
+            )
+        node = node[key]
+    return node
+
+
+def _require_number(manifest: dict, *keys: str) -> float:
     """Pull a numeric field from the manifest with an actionable error."""
-    if key not in manifest:
-        raise KeyError(
-            f"{SPLIT_MANIFEST_PATH}: missing required key {key!r}. "
-            f"Keys present: {sorted(manifest)}"
-        )
-    value = manifest[key]
+    value = _dig(manifest, *keys)
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise TypeError(
-            f"{SPLIT_MANIFEST_PATH}: key {key!r} should be a number, "
+            f"{SPLIT_MANIFEST_PATH}: key {'.'.join(keys)!r} should be a number, "
             f"got {type(value).__name__} ({value!r})."
         )
     return float(value)
@@ -245,16 +259,105 @@ def load_manifest() -> dict:
 
 @lru_cache(maxsize=1)
 def split_boundaries() -> SplitBoundaries:
-    """Return the verified TransactionDT cut points from the manifest."""
+    """Return the verified TransactionDT cut points from the manifest.
+
+    dt_min/dt_max sit at the manifest root; the two cut points are nested
+    under "boundaries".
+    """
     manifest = load_manifest()
     bounds = SplitBoundaries(
-        dt_min=_require(manifest, "dt_min"),
-        dt_max=_require(manifest, "dt_max"),
-        month3_end=_require(manifest, "month3_end"),
-        month4_end=_require(manifest, "month4_end"),
+        dt_min=_require_number(manifest, "dt_min"),
+        dt_max=_require_number(manifest, "dt_max"),
+        month3_end=_require_number(manifest, "boundaries", "month3_end"),
+        month4_end=_require_number(manifest, "boundaries", "month4_end"),
     )
     bounds.verify()
     return bounds
+
+
+# --------------------------------------------------------------------------
+# Per-split row counts and fraud rates, read from the manifest
+# --------------------------------------------------------------------------
+
+#: Fraud rates are stored rounded to 3 decimal places, so compare loosely.
+_FRAUD_RATE_TOLERANCE_PCT: float = 0.001
+
+
+@dataclass(frozen=True)
+class SplitStats:
+    """What Phase 0 recorded about one split, plus where it lives."""
+
+    name: str
+    path: Path
+    rows: int
+    fraud_rate_pct: float
+
+    @property
+    def fraud_rows(self) -> int:
+        """Approximate positive count implied by the recorded rate."""
+        return round(self.rows * self.fraud_rate_pct / 100.0)
+
+    def assert_matches(self, frame, label_column: str = "isFraud") -> None:
+        """Raise unless ``frame`` is the split this object describes.
+
+        Call it right after read_parquet. A silently truncated read, a
+        stale Drive copy, or two splits swapped at the call site all look
+        like ordinary DataFrames -- and every downstream PSI number would
+        be quietly wrong rather than obviously broken.
+        """
+        if len(frame) != self.rows:
+            raise ValueError(
+                f"{self.name} split: expected {self.rows:,} rows per "
+                f"{SPLIT_MANIFEST_PATH.name}, loaded {len(frame):,}."
+            )
+        if label_column in frame.columns:
+            actual = float(frame[label_column].mean()) * 100.0
+            if not math.isclose(
+                actual, self.fraud_rate_pct, abs_tol=_FRAUD_RATE_TOLERANCE_PCT
+            ):
+                raise ValueError(
+                    f"{self.name} split: expected {self.fraud_rate_pct:.3f}% fraud "
+                    f"per {SPLIT_MANIFEST_PATH.name}, loaded {actual:.3f}%. "
+                    "Row count matches, so the file is likely the wrong split "
+                    "or the label column was altered."
+                )
+
+
+@lru_cache(maxsize=1)
+def split_stats() -> dict[str, SplitStats]:
+    """Return the recorded row count and fraud rate for each split.
+
+    Cross-checks that the per-split rows sum to the manifest's total_rows,
+    which catches a manifest assembled from mismatched runs.
+    """
+    manifest = load_manifest()
+    stats = {
+        name: SplitStats(
+            name=name,
+            path=path,
+            rows=int(_require_number(manifest, "splits", name, "rows")),
+            fraud_rate_pct=_require_number(manifest, "splits", name, "fraud_rate_pct"),
+        )
+        for name, path in SPLIT_PATHS.items()
+    }
+
+    total = int(_require_number(manifest, "total_rows"))
+    summed = sum(stat.rows for stat in stats.values())
+    if summed != total:
+        raise ValueError(
+            f"{SPLIT_MANIFEST_PATH.name}: split rows sum to {summed:,} but "
+            f"total_rows is {total:,}. The splits do not partition the dataset."
+        )
+    return stats
+
+
+def dataset_shape() -> tuple[int, int]:
+    """Return (total_rows, total_columns) of the merged dataset."""
+    manifest = load_manifest()
+    return (
+        int(_require_number(manifest, "total_rows")),
+        int(_require_number(manifest, "total_columns")),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -316,6 +419,20 @@ def describe() -> str:
             f"(day {bounds.day_offset(bounds.month4_end):.1f} -> "
             f"{bounds.span_days:.1f})"
         )
+
+    lines.append("")
+    try:
+        stats = split_stats()
+        rows, cols = dataset_shape()
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+        lines.append(f"  split stats: UNAVAILABLE -- {exc}")
+    else:
+        lines.append(f"  dataset: {rows:,} rows x {cols} columns")
+        for stat in stats.values():
+            lines.append(
+                f"    {stat.name:<7} {stat.rows:>8,} rows  "
+                f"{stat.fraud_rate_pct:.3f}% fraud  (~{stat.fraud_rows:,} positives)"
+            )
     return "\n".join(lines)
 
 

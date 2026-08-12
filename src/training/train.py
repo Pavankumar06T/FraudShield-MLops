@@ -30,11 +30,28 @@ rather than a decision anyone made. Metrics are reported at 0.5 for
 continuity, and at the sweep's best-F1 point for what the model can actually
 do.
 
-**No early stopping.** val is the evaluation set, and stopping on it would
-tune the models against the same rows the reported metrics come from,
-flattering every number in the file. Tree counts are fixed instead. Since
-that leaves nothing to reveal an overfit, each model is also scored on the
-training rows and the gap is reported.
+**Early stopping runs against a slice carved from train, never against val.**
+The fixed-400-tree runs left a +0.25 or larger train/val PR-AUC gap, so tree
+count is now chosen rather than assumed: a 2000 ceiling with a 50-round
+patience, monitored on average precision rather than logloss, because
+logloss rewards calibration this model deliberately gives up when
+``scale_pos_weight`` inflates its probabilities.
+
+The carve is **temporal, not random** -- the last ~15% of train by
+``TransactionDT``, cut the same way the train/val/stream boundaries were.
+A shuffled sample would scatter near-duplicate transactions (the same card,
+minutes apart, sharing engineered history) across the boundary, so the
+stopping slice would contain near-copies of rows the model just fitted.
+Stopping would then fire late, against a target easier than anything the
+model will meet in production.
+
+Encoders are fitted on the reduced train only, not on the full split. The
+stopping slice is meant to stand in for unseen data, and an encoder that had
+already seen its category levels would hide exactly the vocabulary drift
+that makes later windows hard.
+
+val is never touched by any of this. It stays an untouched evaluation set,
+which is the only reason its numbers mean anything.
 
     python -m src.training.train
     python -m src.training.train --sample 50000
@@ -81,26 +98,50 @@ XGB_MODEL_PATH: Path = MODELS_DIR / "baseline_xgb.json"
 LGB_MODEL_PATH: Path = MODELS_DIR / "baseline_lgb.txt"
 METRICS_PATH: Path = REPORTS_DIR / "baseline_metrics.json"
 
-#: The first full XGBoost run on the real splits. Kept as a fixed point so a
-#: later run that diverges is visible immediately -- a changed feature
-#: pipeline or a re-split would move these, and silently redefining the
-#: baseline would make every downstream comparison meaningless.
+#: The promoted reference: the first full XGBoost run on the real splits.
+#: Kept as a fixed point so a later run that diverges is visible immediately
+#: -- a changed feature pipeline, a re-split, or a training-regime change
+#: would all move these, and silently redefining the baseline would make
+#: every downstream comparison meaningless. Promote a new figure here only
+#: deliberately, never as a side effect.
 REFERENCE_BASELINE: dict[str, float] = {"pr_auc": 0.5477, "roc_auc": 0.9031}
 
 #: How far a rerun may drift from the reference before it is called out.
 REFERENCE_TOLERANCE: float = 0.01
 
-#: Conventional starting point, not a tuned configuration. Tuning belongs
-#: after the drift loop works end to end. `aucpr` matches the headline metric
-#: so the training log tracks what is actually being optimised.
+#: Val PR-AUC from the previous fixed-400-tree regime, for all three models.
+#: Printed beside the current numbers so the effect of early stopping is
+#: directly visible rather than inferred.
+FIXED_400_PR_AUC: dict[str, float] = {
+    "xgboost": 0.5477,
+    "lightgbm": 0.5482,
+    "ensemble": 0.5513,
+}
+
+#: Ceiling, not a target. Early stopping picks the actual tree count; this
+#: only needs to be high enough that it never binds.
+N_ESTIMATORS_CEILING: int = 2000
+
+#: Rounds without improvement before stopping. Generous, because PR-AUC on
+#: a few thousand positives is noisy round to round and a tight patience
+#: stops on noise.
+EARLY_STOPPING_ROUNDS: int = 50
+
+#: Tail of train reserved for early stopping, by TransactionDT order.
+ES_HOLDOUT_FRACTION: float = 0.15
+
 XGB_HYPERPARAMETERS: dict[str, object] = {
-    "n_estimators": 400,
+    "n_estimators": N_ESTIMATORS_CEILING,
+    "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
     "max_depth": 6,
     "learning_rate": 0.05,
     "subsample": 0.8,
     "colsample_bytree": 0.8,
     "min_child_weight": 1,
     "tree_method": "hist",
+    # aucpr, not logloss: logloss rewards calibrated probabilities, which
+    # scale_pos_weight deliberately destroys. Stopping on it would optimise
+    # something this model is not trying to be good at.
     "eval_metric": "aucpr",
     "n_jobs": -1,
     "random_state": 42,
@@ -116,8 +157,11 @@ XGB_HYPERPARAMETERS: dict[str, object] = {
 #:   quietly hand LightGBM a smaller model.
 #: * ``subsample_freq`` -- LightGBM ignores ``subsample`` entirely unless
 #:   this is >= 1. Without it, row subsampling silently does nothing.
+#:
+#: Early stopping is a fit-time callback here rather than a constructor
+#: argument, which is why it does not appear in this dict.
 LGB_HYPERPARAMETERS: dict[str, object] = {
-    "n_estimators": 400,
+    "n_estimators": N_ESTIMATORS_CEILING,
     "max_depth": 6,
     "num_leaves": 64,
     "learning_rate": 0.05,
@@ -131,10 +175,54 @@ LGB_HYPERPARAMETERS: dict[str, object] = {
     "verbose": -1,
 }
 
+#: LightGBM's name for average precision -- the PR-AUC equivalent of
+#: XGBoost's "aucpr".
+LGB_EVAL_METRIC: str = "average_precision"
+
 DEFAULT_THRESHOLD: float = 0.5
 
 #: Key under which the ensemble is recorded, and the models it averages.
 ENSEMBLE_MEMBERS: tuple[str, str] = ("xgboost", "lightgbm")
+
+TIME_COLUMN: str = "TransactionDT"
+
+
+def temporal_holdout(
+    frame: pd.DataFrame,
+    fraction: float = ES_HOLDOUT_FRACTION,
+    time_column: str = TIME_COLUMN,
+) -> tuple[pd.DataFrame, pd.DataFrame, float]:
+    """Split off the latest ``fraction`` of rows by time, not at random.
+
+    Returns ``(earlier, later, cutoff)``. The cut is on the value of
+    ``time_column`` rather than on row position, so it behaves the same
+    whether or not the frame arrived sorted -- and matches how the
+    train/val/stream boundaries themselves were drawn.
+
+    Ties land in the later part, so the realised fraction can exceed the
+    requested one when many transactions share a timestamp. The caller
+    reports what it actually got rather than what it asked for.
+    """
+    if time_column not in frame.columns:
+        raise KeyError(
+            f"{time_column!r} is required to carve a temporal holdout but is "
+            f"not in the frame. Carve before build_features drops it."
+        )
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(f"fraction must be in (0, 1), got {fraction}.")
+
+    times = frame[time_column]
+    cutoff = float(times.quantile(1.0 - fraction))
+    earlier = frame[times < cutoff]
+    later = frame[times >= cutoff]
+
+    if earlier.empty or later.empty:
+        raise ValueError(
+            f"Temporal cut at {time_column}={cutoff:,.0f} left "
+            f"{len(earlier):,} / {len(later):,} rows. The column is likely "
+            "constant or near-constant."
+        )
+    return earlier, later, cutoff
 
 
 def scale_pos_weight(y: pd.Series) -> float:
@@ -144,6 +232,10 @@ def scale_pos_weight(y: pd.Series) -> float:
     stops treating "call everything legitimate" as a good local minimum.
     XGBoost and LightGBM spell it the same way and mean the same thing, so
     both get the identical value computed from the training labels.
+
+    Recomputed from whatever rows actually train the model -- after the
+    early-stopping slice is carved out, not before. The two differ whenever
+    the fraud rate drifts across the split, which in this dataset it does.
 
     The cost is calibration: predicted probabilities come out inflated and
     can no longer be read as "an 0.8 here means 80% of these are fraud".
@@ -247,7 +339,12 @@ def evaluate_proba(y: pd.Series | np.ndarray, proba: np.ndarray) -> dict:
 
 
 def positive_proba(model, X: pd.DataFrame) -> np.ndarray:
-    """Positive-class probability from either sklearn wrapper or raw Booster."""
+    """Positive-class probability from either sklearn wrapper or raw Booster.
+
+    Both wrappers predict with their own best iteration once early stopping
+    has run, so callers get the stopped model rather than the full ceiling
+    without having to ask.
+    """
     if hasattr(model, "predict_proba"):
         scores = model.predict_proba(X)
         return np.asarray(scores)[:, 1] if np.ndim(scores) == 2 else np.asarray(scores)
@@ -270,24 +367,77 @@ def ensemble_proba(*probas: np.ndarray) -> np.ndarray:
     return np.mean(np.column_stack(probas), axis=1)
 
 
-def train_xgboost(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
-    """Fit the XGBoost baseline with imbalance reweighting."""
-    model = xgb.XGBClassifier(**XGB_HYPERPARAMETERS, scale_pos_weight=scale_pos_weight(y))
-    model.fit(X, y, verbose=False)
+def trees_used(model) -> int:
+    """How many boosting rounds the stopped model actually predicts with.
+
+    The two libraries index this differently -- XGBoost's ``best_iteration``
+    is 0-based, LightGBM's ``best_iteration_`` is 1-based -- and reporting
+    one as the other would be off by one in opposite directions.
+    """
+    best = getattr(model, "best_iteration", None)
+    if best is not None:
+        return int(best) + 1
+    best = getattr(model, "best_iteration_", None)
+    if best:
+        return int(best)
+    return int(getattr(model, "n_estimators", 0))
+
+
+def train_xgboost(
+    X: pd.DataFrame,
+    y: pd.Series,
+    X_stop: pd.DataFrame | None = None,
+    y_stop: pd.Series | None = None,
+) -> xgb.XGBClassifier:
+    """Fit XGBoost, stopping on the carved slice when one is supplied.
+
+    ``early_stopping_rounds`` belongs in the constructor for XGBoost 2.0+;
+    passing it to ``fit`` raises. With no stopping slice the ceiling is
+    trained out in full, which is only useful for tests.
+    """
+    params = dict(XGB_HYPERPARAMETERS)
+    if X_stop is None:
+        params.pop("early_stopping_rounds", None)
+
+    model = xgb.XGBClassifier(**params, scale_pos_weight=scale_pos_weight(y))
+    if X_stop is None:
+        model.fit(X, y, verbose=False)
+    else:
+        model.fit(X, y, eval_set=[(X_stop, y_stop)], verbose=False)
     return model
 
 
-def train_lightgbm(X: pd.DataFrame, y: pd.Series) -> lgb.LGBMClassifier:
-    """Fit the LightGBM baseline on the identical features and weighting.
+def train_lightgbm(
+    X: pd.DataFrame,
+    y: pd.Series,
+    X_stop: pd.DataFrame | None = None,
+    y_stop: pd.Series | None = None,
+) -> lgb.LGBMClassifier:
+    """Fit LightGBM on the identical features, weighting and stopping rule.
 
     LightGBM handles NaN natively, like XGBoost, so the no-imputation stance
     carries over unchanged. The ordinal codes are passed as plain numerics
     rather than declared via ``categorical_feature`` -- declaring them would
     change the split semantics and the two models would no longer be
     comparable on equal footing.
+
+    ``eval_X``/``eval_y`` rather than ``eval_set``: the latter is deprecated
+    in LightGBM 4.6+ and warns on every fit.
     """
-    model = lgb.LGBMClassifier(**LGB_HYPERPARAMETERS, scale_pos_weight=scale_pos_weight(y))
-    model.fit(X, y)
+    model = lgb.LGBMClassifier(
+        **LGB_HYPERPARAMETERS, scale_pos_weight=scale_pos_weight(y)
+    )
+    if X_stop is None:
+        model.fit(X, y)
+    else:
+        model.fit(
+            X,
+            y,
+            eval_X=X_stop,
+            eval_y=y_stop,
+            eval_metric=LGB_EVAL_METRIC,
+            callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
+        )
     return model
 
 
@@ -326,38 +476,57 @@ def _format_metrics(metrics: dict, title: str) -> str:
 
 
 def _format_comparison(blocks: dict[str, dict]) -> str:
-    """Side-by-side table across all three models."""
+    """Side-by-side across all three models, against the fixed-400 regime."""
     lines = [
         "",
-        "=" * 66,
-        f"  {'model':<12}{'PR-AUC':>9}{'lift':>8}{'ROC-AUC':>10}"
-        f"{'best F1':>10}{'train gap':>12}",
-        "  " + "-" * 62,
+        "=" * 78,
+        f"  {'model':<11}{'trees':>7}{'/ ceiling':>11}{'PR-AUC':>9}"
+        f"{'was @400':>10}{'delta':>9}{'ROC-AUC':>10}{'train gap':>11}",
+        "  " + "-" * 74,
     ]
     for name, block in blocks.items():
         val = block["val"]
+        previous = FIXED_400_PR_AUC.get(name)
+        used = block.get("n_trees_used")
+        ceiling = block.get("n_estimators_ceiling")
+        trees = f"{used:,}" if used else "-"
+        against = f"{ceiling:,}" if ceiling else "-"
+        was = f"{previous:.4f}" if previous is not None else "-"
+        delta = f"{val['pr_auc'] - previous:+.4f}" if previous is not None else "-"
         lines.append(
-            f"  {name:<12}{val['pr_auc']:>9.4f}"
-            f"{val['pr_auc_lift_over_floor']:>7.1f}x"
-            f"{val['roc_auc']:>10.4f}"
-            f"{val['at_best_f1_threshold']['f1']:>10.4f}"
-            f"{block['overfit_gap_pr_auc']:>+12.4f}"
+            f"  {name:<11}{trees:>7}{against:>11}{val['pr_auc']:>9.4f}"
+            f"{was:>10}{delta:>9}{val['roc_auc']:>10.4f}"
+            f"{block['overfit_gap_pr_auc']:>+11.4f}"
         )
     best = max(blocks, key=lambda name: blocks[name]["val"]["pr_auc"])
-    lines += ["  " + "-" * 62, f"  best by PR-AUC: {best}", "=" * 66]
+    lines += ["  " + "-" * 74, f"  best by PR-AUC: {best}", "=" * 78]
     return "\n".join(lines)
 
 
-def _model_block(model, X_train, y_train, X_val, y_val, params: dict | None) -> dict:
-    """Val metrics, train metrics, and the gap between them, for one model."""
+def _model_block(
+    model, X_train, y_train, X_val, y_val, params: dict | None, stopped: bool
+) -> dict:
+    """Val metrics, train metrics, the gap, and how many trees survived."""
     val = evaluate(model, X_val, y_val)
     train = evaluate(model, X_train, y_train)
+    used = trees_used(model)
     return {
         "val": val,
         "train": train,
         "overfit_gap_pr_auc": float(train["pr_auc"] - val["pr_auc"]),
+        "n_trees_used": used,
+        "n_estimators_ceiling": N_ESTIMATORS_CEILING,
+        "early_stopped": bool(stopped and used < N_ESTIMATORS_CEILING),
+        "hit_ceiling": bool(stopped and used >= N_ESTIMATORS_CEILING),
         "hyperparameters": params,
     }
+
+
+def _split_summary(name: str, y: pd.Series) -> str:
+    return (
+        f"    {name:<22}{len(y):>9,} rows  {int(y.sum()):>7,} positive  "
+        f"{y.mean() * 100:>6.3f}%"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -371,6 +540,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="read only the first N rows of each split (smoke test on a small machine)",
     )
+    parser.add_argument(
+        "--holdout-fraction",
+        type=float,
+        default=ES_HOLDOUT_FRACTION,
+        metavar="F",
+        help=f"tail of train reserved for early stopping (default {ES_HOLDOUT_FRACTION})",
+    )
     args = parser.parse_args(argv)
     sampling = args.sample is not None
 
@@ -383,8 +559,17 @@ def main(argv: list[str] | None = None) -> int:
     if not sampling:
         stats["train"].assert_matches(train_frame)
 
-    X_train, y_train, encoders = build_features(train_frame)
+    # Carve before build_features, which drops TransactionDT.
+    fit_frame, stop_frame, cutoff = temporal_holdout(train_frame, args.holdout_fraction)
+    realised = len(stop_frame) / len(train_frame)
     del train_frame
+    gc.collect()
+
+    # Encoders see only the rows that train the model. Fitting them on the
+    # full split would let the stopping slice's category levels leak in.
+    X_fit, y_fit, encoders = build_features(fit_frame)
+    X_stop, y_stop, _ = build_features(stop_frame, encoders)
+    del fit_frame, stop_frame
     gc.collect()
 
     print(f"loading  {VAL_PARQUET}{suffix}")
@@ -398,33 +583,43 @@ def main(argv: list[str] | None = None) -> int:
     del val_frame
     gc.collect()
 
-    if y_train is None or y_val is None:
-        raise ValueError("Both splits must carry the isFraud label to train.")
+    if y_fit is None or y_stop is None or y_val is None:
+        raise ValueError("Every split must carry the isFraud label to train.")
 
-    weight = scale_pos_weight(y_train)
+    weight = scale_pos_weight(y_fit)
     print(
-        f"\ntrain: {len(X_train):,} rows x {X_train.shape[1]} features, "
-        f"{int(y_train.sum()):,} positive ({y_train.mean() * 100:.3f}%)\n"
-        f"val:   {len(X_val):,} rows, {int(y_val.sum()):,} positive "
-        f"({y_val.mean() * 100:.3f}%)\n"
-        f"  scale_pos_weight {weight:.2f}  "
-        f"({int(len(y_train) - y_train.sum()):,} neg / {int(y_train.sum()):,} pos), "
-        "applied to both models"
+        f"\ntemporal carve at {TIME_COLUMN} >= {cutoff:,.0f}  "
+        f"(last {realised * 100:.1f}% of train, requested "
+        f"{args.holdout_fraction * 100:.0f}%)\n"
+        f"{_split_summary('train (reduced)', y_fit)}\n"
+        f"{_split_summary('early-stopping slice', y_stop)}\n"
+        f"{_split_summary('val (untouched)', y_val)}\n"
+        f"\n  {X_fit.shape[1]} features, scale_pos_weight {weight:.2f} "
+        f"recomputed from the reduced train, applied to both models"
     )
 
-    print(f"\n  fitting XGBoost  ({XGB_HYPERPARAMETERS['n_estimators']} trees) ...")
-    xgb_model = train_xgboost(X_train, y_train)
-    print(f"  fitting LightGBM ({LGB_HYPERPARAMETERS['n_estimators']} trees) ...")
-    lgb_model = train_lightgbm(X_train, y_train)
+    print(
+        f"\n  fitting XGBoost  (ceiling {N_ESTIMATORS_CEILING:,}, patience "
+        f"{EARLY_STOPPING_ROUNDS}, monitoring aucpr) ..."
+    )
+    xgb_model = train_xgboost(X_fit, y_fit, X_stop, y_stop)
+    print(
+        f"  fitting LightGBM (ceiling {N_ESTIMATORS_CEILING:,}, patience "
+        f"{EARLY_STOPPING_ROUNDS}, monitoring {LGB_EVAL_METRIC}) ..."
+    )
+    lgb_model = train_lightgbm(X_fit, y_fit, X_stop, y_stop)
 
     blocks: dict[str, dict] = {
         "xgboost": _model_block(
-            xgb_model, X_train, y_train, X_val, y_val, XGB_HYPERPARAMETERS
+            xgb_model, X_fit, y_fit, X_val, y_val, XGB_HYPERPARAMETERS, True
         ),
         "lightgbm": _model_block(
-            lgb_model, X_train, y_train, X_val, y_val, LGB_HYPERPARAMETERS
+            lgb_model, X_fit, y_fit, X_val, y_val, LGB_HYPERPARAMETERS, True
         ),
     }
+    for name, model in (("xgboost", xgb_model), ("lightgbm", lgb_model)):
+        block = blocks[name]
+        block["stopping_slice"] = evaluate(model, X_stop, y_stop)
 
     xgb_val_proba = positive_proba(xgb_model, X_val)
     lgb_val_proba = positive_proba(lgb_model, X_val)
@@ -432,15 +627,18 @@ def main(argv: list[str] | None = None) -> int:
 
     ensemble_val = evaluate_proba(y_val, ensemble_proba(xgb_val_proba, lgb_val_proba))
     ensemble_train = evaluate_proba(
-        y_train,
+        y_fit,
         ensemble_proba(
-            positive_proba(xgb_model, X_train), positive_proba(lgb_model, X_train)
+            positive_proba(xgb_model, X_fit), positive_proba(lgb_model, X_fit)
         ),
     )
     blocks["ensemble"] = {
         "val": ensemble_val,
         "train": ensemble_train,
         "overfit_gap_pr_auc": float(ensemble_train["pr_auc"] - ensemble_val["pr_auc"]),
+        "n_trees_used": None,
+        "n_estimators_ceiling": None,
+        "early_stopped": None,
         "hyperparameters": None,
         "members": list(ENSEMBLE_MEMBERS),
         "method": "mean of member positive-class probabilities",
@@ -449,14 +647,24 @@ def main(argv: list[str] | None = None) -> int:
 
     for name, block in blocks.items():
         print(_format_metrics(block["val"], name))
+        if block.get("n_trees_used"):
+            ceiling_note = (
+                "  HIT THE CEILING -- raise it; the tree count was capped, not chosen."
+                if block["hit_ceiling"]
+                else ""
+            )
+            print(
+                f"  trees used {block['n_trees_used']:,} of "
+                f"{block['n_estimators_ceiling']:,}{ceiling_note}"
+            )
         print(
             f"  train PR-AUC {block['train']['pr_auc']:.4f} vs val "
             f"{block['val']['pr_auc']:.4f}  (gap {block['overfit_gap_pr_auc']:+.4f})"
         )
         if block["overfit_gap_pr_auc"] > 0.25:
             print(
-                f"  WARNING: train scores {block['overfit_gap_pr_auc']:.2f} above "
-                f"val -- likely too much capacity for {len(X_train):,} rows."
+                f"  WARNING: train still scores {block['overfit_gap_pr_auc']:.2f} "
+                "above val despite early stopping."
             )
 
     print(_format_comparison(blocks))
@@ -484,9 +692,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not matches and not sampling:
         print(
-            "  DIVERGED from the reference baseline. Something upstream changed --\n"
-            "  the feature pipeline, the split, or the library versions. Do not\n"
-            "  redefine the baseline without knowing which."
+            "  DIVERGED from the reference. Early stopping changed the training\n"
+            "  regime, so a shift here is expected rather than alarming -- but the\n"
+            "  constant is NOT updated automatically. Promote the new figure in\n"
+            "  REFERENCE_BASELINE only once you have decided it is the better bar."
         )
 
     record = {
@@ -494,18 +703,32 @@ def main(argv: list[str] | None = None) -> int:
         "sampled": sampling,
         "sample_rows": args.sample,
         "data": {
-            "train_rows": int(len(X_train)),
+            "train_rows_reduced": int(len(X_fit)),
+            "stopping_slice_rows": int(len(X_stop)),
             "val_rows": int(len(X_val)),
-            "n_features": int(X_train.shape[1]),
+            "n_features": int(X_fit.shape[1]),
             "n_categorical_encoded": len(encoders.categorical_names),
-            "train_positive_rate": float(y_train.mean()),
-            "train_positives": int(y_train.sum()),
+            "train_positive_rate": float(y_fit.mean()),
+            "train_positives": int(y_fit.sum()),
+            "stopping_slice_positive_rate": float(y_stop.mean()),
+            "stopping_slice_positives": int(y_stop.sum()),
             "val_positive_rate": float(y_val.mean()),
             "val_positives": int(y_val.sum()),
             "scale_pos_weight": float(weight),
         },
+        "early_stopping": {
+            "strategy": "temporal tail of train, cut on TransactionDT",
+            "requested_fraction": float(args.holdout_fraction),
+            "realised_fraction": float(realised),
+            "cutoff_transaction_dt": cutoff,
+            "n_estimators_ceiling": N_ESTIMATORS_CEILING,
+            "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+            "monitored_metric": {"xgboost": "aucpr", "lightgbm": LGB_EVAL_METRIC},
+            "encoders_fitted_on": "reduced train only",
+            "val_used_for_stopping": False,
+        },
         "reference_baseline": {
-            "note": "first full XGBoost run on the real splits; fixed point for comparison",
+            "note": "promoted reference; not updated automatically",
             **REFERENCE_BASELINE,
             "observed_xgboost_pr_auc": observed["pr_auc"],
             "observed_xgboost_roc_auc": observed["roc_auc"],
@@ -513,6 +736,7 @@ def main(argv: list[str] | None = None) -> int:
             "within_tolerance": bool(matches),
             "tolerance": REFERENCE_TOLERANCE,
         },
+        "previous_fixed_400_pr_auc": FIXED_400_PR_AUC,
         "models": blocks,
         "best_by_pr_auc": max(blocks, key=lambda n: blocks[n]["val"]["pr_auc"]),
         "environment": {
@@ -533,7 +757,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     xgb_model.save_model(XGB_MODEL_PATH)
-    lgb_model.booster_.save_model(str(LGB_MODEL_PATH))
+    lgb_model.booster_.save_model(
+        str(LGB_MODEL_PATH), num_iteration=lgb_model.best_iteration_
+    )
     encoders.save(ENCODERS_PATH)
     METRICS_PATH.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
@@ -542,8 +768,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"wrote    {ENCODERS_PATH}")
     print(f"wrote    {METRICS_PATH}")
 
-    # A model without its encoders is unusable, and both must round-trip or
-    # serving will silently score against the wrong codes.
+    # With early stopping the saved artifact must predict with the stopped
+    # tree count, not the full ceiling. XGBoost carries best_iteration inside
+    # the JSON; LightGBM needs num_iteration passed at save time. If either
+    # were wrong, serving would quietly use hundreds of trees the model was
+    # never validated with.
     probe = X_val.head(1000)
     reloaded_xgb = xgb.XGBClassifier()
     reloaded_xgb.load_model(XGB_MODEL_PATH)
@@ -558,7 +787,11 @@ def main(argv: list[str] | None = None) -> int:
             positive_proba(reloaded, probe), positive_proba(original, probe), atol=1e-6
         ):
             raise RuntimeError(f"Reloaded {name} does not reproduce its predictions.")
-    print("verified round-trip: both models reproduce their predictions")
+    print(
+        f"verified round-trip: both models reproduce their predictions at "
+        f"{blocks['xgboost']['n_trees_used']:,} / "
+        f"{blocks['lightgbm']['n_trees_used']:,} trees"
+    )
     return 0
 
 

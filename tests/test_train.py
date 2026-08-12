@@ -17,7 +17,9 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.training.train import (
     DEFAULT_THRESHOLD,
+    LGB_EVAL_METRIC,
     LGB_HYPERPARAMETERS,
+    N_ESTIMATORS_CEILING,
     XGB_HYPERPARAMETERS,
     best_f1_threshold,
     ensemble_proba,
@@ -25,9 +27,11 @@ from src.training.train import (
     evaluate_proba,
     positive_proba,
     scale_pos_weight,
+    temporal_holdout,
     threshold_metrics,
     train_lightgbm,
     train_model,
+    trees_used,
 )
 
 BASE_RATE = 0.034
@@ -177,43 +181,190 @@ def learnable(n: int = 6_000, seed: int = 3):
     return X, y
 
 
+def learnable_with_stop(n: int = 6_000, seed: int = 3, fraction: float = 0.15):
+    """Same frame, split into fit and early-stopping parts.
+
+    Tests train through the real stopping path rather than the 2000-tree
+    ceiling -- both because it is what production does, and because fitting
+    the full ceiling on every test would dominate the suite runtime.
+    """
+    X, y = learnable(n, seed)
+    cut = int(len(X) * (1 - fraction))
+    return X[:cut], y[:cut], X[cut:], y[cut:]
+
+
 def test_trained_model_beats_the_no_skill_floor():
-    X, y = learnable()
-    model = train_model(X, y)
-    metrics = evaluate(model, X, y)
+    Xf, yf, Xs, ys = learnable_with_stop()
+    metrics = evaluate(train_model(Xf, yf, Xs, ys), Xf, yf)
     assert metrics["pr_auc"] > 3 * metrics["pr_auc_no_skill_floor"]
 
 
 def test_model_handles_nan_without_imputation():
-    X, y = learnable()
-    assert X["with_gaps"].isna().any()
-    model = train_model(X, y)
-    assert np.isfinite(model.predict_proba(X)[:, 1]).all()
+    Xf, yf, Xs, ys = learnable_with_stop()
+    assert Xf["with_gaps"].isna().any()
+    assert np.isfinite(positive_proba(train_model(Xf, yf, Xs, ys), Xf)).all()
 
 
 def test_metrics_block_is_json_serialisable():
     """numpy scalars leak through json.dump as TypeError, and the metrics
     file is the artifact every later phase reads."""
-    X, y = learnable()
-    metrics = evaluate(train_model(X, y), X, y)
+    Xf, yf, Xs, ys = learnable_with_stop()
+    metrics = evaluate(train_model(Xf, yf, Xs, ys), Xf, yf)
     round_tripped = json.loads(json.dumps(metrics))
     assert round_tripped["pr_auc"] == pytest.approx(metrics["pr_auc"])
     assert set(round_tripped) == set(metrics)
 
 
 def test_model_round_trips_through_disk(tmp_path):
+    """The saved artifact must predict with the stopped tree count, not the
+    full ceiling -- otherwise serving quietly uses trees never validated."""
     import xgboost as xgb
 
-    X, y = learnable()
-    model = train_model(X, y)
+    Xf, yf, Xs, ys = learnable_with_stop()
+    model = train_model(Xf, yf, Xs, ys)
     path = tmp_path / "m.json"
     model.save_model(path)
 
     reloaded = xgb.XGBClassifier()
     reloaded.load_model(path)
+    assert reloaded.best_iteration == model.best_iteration
     np.testing.assert_allclose(
-        reloaded.predict_proba(X)[:, 1], model.predict_proba(X)[:, 1], rtol=1e-6
+        reloaded.predict_proba(Xf)[:, 1], model.predict_proba(Xf)[:, 1], rtol=1e-6
     )
+
+
+def test_lightgbm_round_trips_at_its_stopped_tree_count(tmp_path):
+    """LightGBM does not carry best_iteration into the saved file -- it must
+    be passed at save time or the artifact holds every tree to the ceiling."""
+    import lightgbm as lgb
+
+    Xf, yf, Xs, ys = learnable_with_stop()
+    model = train_lightgbm(Xf, yf, Xs, ys)
+    path = tmp_path / "m.txt"
+    model.booster_.save_model(str(path), num_iteration=model.best_iteration_)
+
+    reloaded = lgb.Booster(model_file=str(path))
+    assert reloaded.num_trees() == model.best_iteration_
+    np.testing.assert_allclose(
+        positive_proba(reloaded, Xf), positive_proba(model, Xf), atol=1e-9
+    )
+
+
+# --------------------------------------------------------------------------
+# The temporal carve
+# --------------------------------------------------------------------------
+
+
+def timed(n: int = 1_000, seed: int = 9) -> pd.DataFrame:
+    """A frame whose row order deliberately disagrees with its time order."""
+    rng = np.random.default_rng(seed)
+    frame = pd.DataFrame(
+        {"TransactionDT": np.arange(n) * 100.0, "v": rng.normal(size=n)}
+    )
+    return frame.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+
+
+def test_carve_takes_the_latest_rows_not_the_last_positions():
+    """The frame is shuffled, so a positional tail would be a random sample.
+
+    This is the property the whole design rests on: every stopping row must
+    come after every fitting row in time.
+    """
+    frame = timed()
+    earlier, later, cutoff = temporal_holdout(frame, 0.15)
+    assert earlier["TransactionDT"].max() < cutoff <= later["TransactionDT"].min()
+
+
+def test_carve_partitions_without_overlap_or_loss():
+    frame = timed()
+    earlier, later, _ = temporal_holdout(frame, 0.15)
+    assert len(earlier) + len(later) == len(frame)
+    assert not set(earlier.index) & set(later.index)
+
+
+def test_carve_takes_roughly_the_requested_fraction():
+    frame = timed(n=10_000)
+    _, later, _ = temporal_holdout(frame, 0.15)
+    assert 0.14 <= len(later) / len(frame) <= 0.16
+
+
+@pytest.mark.parametrize("fraction", [0.05, 0.15, 0.30])
+def test_carve_honours_different_fractions(fraction):
+    frame = timed(n=10_000)
+    _, later, _ = temporal_holdout(frame, fraction)
+    assert abs(len(later) / len(frame) - fraction) < 0.01
+
+
+def test_carve_requires_the_time_column():
+    """build_features drops TransactionDT, so carving after it would fail."""
+    with pytest.raises(KeyError, match="TransactionDT"):
+        temporal_holdout(pd.DataFrame({"v": [1, 2, 3]}))
+
+
+@pytest.mark.parametrize("fraction", [0.0, 1.0, -0.1, 1.5])
+def test_carve_rejects_impossible_fractions(fraction):
+    with pytest.raises(ValueError, match="fraction"):
+        temporal_holdout(timed(), fraction)
+
+
+def test_carve_rejects_a_constant_time_column():
+    frame = pd.DataFrame({"TransactionDT": np.ones(100), "v": np.arange(100.0)})
+    with pytest.raises(ValueError, match="constant"):
+        temporal_holdout(frame)
+
+
+# --------------------------------------------------------------------------
+# Early stopping
+# --------------------------------------------------------------------------
+
+
+def test_early_stopping_chooses_a_tree_count_below_the_ceiling():
+    Xf, yf, Xs, ys = learnable_with_stop()
+    for model in (train_model(Xf, yf, Xs, ys), train_lightgbm(Xf, yf, Xs, ys)):
+        used = trees_used(model)
+        assert 0 < used < N_ESTIMATORS_CEILING
+
+
+def test_trees_used_handles_both_index_conventions():
+    """XGBoost's best_iteration is 0-based, LightGBM's best_iteration_ is
+    1-based. Reporting one as the other is off by one, in opposite
+    directions."""
+    Xf, yf, Xs, ys = learnable_with_stop()
+
+    xgb_model = train_model(Xf, yf, Xs, ys)
+    assert trees_used(xgb_model) == xgb_model.best_iteration + 1
+
+    lgb_model = train_lightgbm(Xf, yf, Xs, ys)
+    assert trees_used(lgb_model) == lgb_model.best_iteration_
+
+
+def test_ceiling_is_generous_enough_to_be_a_ceiling():
+    assert XGB_HYPERPARAMETERS["n_estimators"] == N_ESTIMATORS_CEILING
+    assert LGB_HYPERPARAMETERS["n_estimators"] == N_ESTIMATORS_CEILING
+
+
+def test_stopping_monitors_pr_auc_not_logloss():
+    """logloss rewards calibration that scale_pos_weight deliberately
+    destroys, so stopping on it optimises the wrong thing."""
+    assert XGB_HYPERPARAMETERS["eval_metric"] == "aucpr"
+    assert LGB_EVAL_METRIC == "average_precision"
+
+
+def test_scale_pos_weight_is_recomputed_from_the_reduced_train():
+    """The fraud rate drifts across the carve, so the full-train and
+    reduced-train weights differ -- using the former would misweight.
+
+    Modelled on the real shape: train sits at 3.40% and val at 3.93%, so the
+    tail of train is richer in positives than the head.
+    """
+    early = [1 if i % 25 == 0 else 0 for i in range(850)]  # 4.0%
+    late = [1 if i % 10 == 0 else 0 for i in range(150)]  # 10.0%
+    y_full = pd.Series(early + late)
+    y_reduced = y_full.iloc[:850]
+
+    assert y_reduced.mean() < y_full.mean()  # the tail really is richer
+    # a rarer positive class needs a larger weight
+    assert scale_pos_weight(y_reduced) > scale_pos_weight(y_full)
 
 
 # --------------------------------------------------------------------------

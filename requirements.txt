@@ -13,7 +13,8 @@ pyarrow>=15.0
 # --- Modelling ---
 scikit-learn>=1.4
 xgboost>=2.0
-lightgbm>=4.3
+# >=4.6 for eval_X/eval_y; eval_set is deprecated and warns on every fit
+lightgbm>=4.6
 
 # --- Explainability ---
 shap>=0.45

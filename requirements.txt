@@ -13,8 +13,9 @@ pyarrow>=15.0
 # --- Modelling ---
 scikit-learn>=1.4
 xgboost>=2.0
-# >=4.6 for eval_X/eval_y; eval_set is deprecated and warns on every fit
-lightgbm>=4.6
+# >=4.3 for the lgb.early_stopping callback, which replaced
+# early_stopping_rounds as a fit argument in the 4.x line
+lightgbm>=4.3
 
 # --- Explainability ---
 shap>=0.45

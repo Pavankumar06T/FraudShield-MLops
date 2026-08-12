@@ -159,7 +159,9 @@ XGB_HYPERPARAMETERS: dict[str, object] = {
 #:   this is >= 1. Without it, row subsampling silently does nothing.
 #:
 #: Early stopping is a fit-time callback here rather than a constructor
-#: argument, which is why it does not appear in this dict.
+#: argument, which is why it does not appear in this dict. LightGBM 4.x
+#: removed ``early_stopping_rounds`` as a fit argument; the callback is the
+#: replacement.
 LGB_HYPERPARAMETERS: dict[str, object] = {
     "n_estimators": N_ESTIMATORS_CEILING,
     "max_depth": 6,
@@ -421,8 +423,13 @@ def train_lightgbm(
     change the split semantics and the two models would no longer be
     comparable on equal footing.
 
-    ``eval_X``/``eval_y`` rather than ``eval_set``: the latter is deprecated
-    in LightGBM 4.6+ and warns on every fit.
+    The early-stopping call shape is ``eval_set=[(X, y)]`` plus a
+    ``lgb.early_stopping`` callback. What LightGBM 4.x actually removed is
+    ``early_stopping_rounds`` as a *fit argument*; ``eval_set`` itself is
+    current and is the only form present in stock builds. Do not swap it for
+    ``eval_X``/``eval_y`` on the strength of a local deprecation warning --
+    that pair exists in some patched builds only, and the substitution
+    raises TypeError everywhere else.
     """
     model = lgb.LGBMClassifier(
         **LGB_HYPERPARAMETERS, scale_pos_weight=scale_pos_weight(y)
@@ -433,10 +440,13 @@ def train_lightgbm(
         model.fit(
             X,
             y,
-            eval_X=X_stop,
-            eval_y=y_stop,
+            eval_set=[(X_stop, y_stop)],
             eval_metric=LGB_EVAL_METRIC,
-            callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)],
+            callbacks=[
+                lgb.early_stopping(
+                    stopping_rounds=EARLY_STOPPING_ROUNDS, verbose=False
+                )
+            ],
         )
     return model
 

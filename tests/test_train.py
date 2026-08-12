@@ -17,6 +17,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.training.train import (
     DEFAULT_THRESHOLD,
+    EARLY_STOPPING_ROUNDS,
     LGB_EVAL_METRIC,
     LGB_HYPERPARAMETERS,
     N_ESTIMATORS_CEILING,
@@ -323,6 +324,83 @@ def test_early_stopping_chooses_a_tree_count_below_the_ceiling():
     for model in (train_model(Xf, yf, Xs, ys), train_lightgbm(Xf, yf, Xs, ys)):
         used = trees_used(model)
         assert 0 < used < N_ESTIMATORS_CEILING
+
+
+def test_lightgbm_fit_accepts_our_exact_early_stopping_call():
+    """Call the real LGBMClassifier.fit with the exact keywords we use.
+
+    Nothing here goes through train_lightgbm, and nothing is mocked -- a
+    wrapper test can only prove the wrapper is self-consistent, and a mock
+    would have happily accepted the eval_X call that crashed the real run.
+    If LightGBM's fit signature and ours ever disagree again, this fails in
+    a second rather than twenty minutes into a training run.
+    """
+    import lightgbm as lgb
+
+    Xf, yf, Xs, ys = learnable_with_stop(n=1_200)
+    model = lgb.LGBMClassifier(
+        **LGB_HYPERPARAMETERS, scale_pos_weight=scale_pos_weight(yf)
+    )
+    model.fit(
+        Xf,
+        yf,
+        eval_set=[(Xs, ys)],
+        eval_metric=LGB_EVAL_METRIC,
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=EARLY_STOPPING_ROUNDS, verbose=False)
+        ],
+    )
+    assert 0 < model.best_iteration_ < N_ESTIMATORS_CEILING
+    assert LGB_EVAL_METRIC in model.best_score_["valid_0"]
+
+
+def test_train_lightgbm_passes_eval_set_and_not_eval_x(monkeypatch):
+    """Pin the call shape, because one machine cannot prove portability.
+
+    The environment this was developed on carries a patched LightGBM that
+    accepts eval_X as well as eval_set, so the end-to-end test above passed
+    locally while the real run raised TypeError. Asserting on the keywords
+    themselves is what actually catches the substitution here.
+    """
+    import lightgbm as lgb
+
+    captured: dict = {}
+    original = lgb.LGBMClassifier.fit
+
+    def spy(self, X, y, **kwargs):
+        captured.update(kwargs)
+        return original(self, X, y, **kwargs)
+
+    monkeypatch.setattr(lgb.LGBMClassifier, "fit", spy)
+
+    Xf, yf, Xs, ys = learnable_with_stop(n=1_200)
+    train_lightgbm(Xf, yf, Xs, ys)
+
+    assert "eval_set" in captured, "early stopping must be driven by eval_set"
+    assert "eval_X" not in captured and "eval_y" not in captured, (
+        "eval_X/eval_y exist only in patched builds and raise TypeError on stock "
+        "LightGBM"
+    )
+    # early_stopping_rounds as a fit argument is the part that really was removed
+    assert "early_stopping_rounds" not in captured
+
+    (eval_X, eval_y), = captured["eval_set"]
+    assert len(eval_X) == len(Xs) and len(eval_y) == len(ys)
+    assert captured["eval_metric"] == LGB_EVAL_METRIC
+    assert captured["callbacks"]
+
+
+def test_early_stopping_rounds_really_is_gone_from_fit():
+    """Documents the deprecation that is real, as opposed to the one that
+    was inferred from a local warning."""
+    import inspect
+
+    import lightgbm as lgb
+
+    parameters = inspect.signature(lgb.LGBMClassifier.fit).parameters
+    assert "early_stopping_rounds" not in parameters
+    assert "eval_set" in parameters
+    assert "callbacks" in parameters
 
 
 def test_trees_used_handles_both_index_conventions():

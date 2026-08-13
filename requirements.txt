@@ -46,6 +46,12 @@ evidently>=0.7
 # --- Testing ---
 pytest>=8.0
 
+# --- Streaming ---
+# confluent-kafka rather than kafka-python: it wraps librdkafka, ships
+# wheels for Windows and Linux, and tracks the Kafka protocol that
+# Redpanda implements.
+confluent-kafka>=2.3
+
 # --- Serving ---
 fastapi>=0.110
 uvicorn[standard]>=0.27

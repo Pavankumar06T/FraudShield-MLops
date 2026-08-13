@@ -169,7 +169,7 @@ def test_unbounded_prediction_would_differ_materially(sample, encoders, booster)
 def test_contributions_sum_to_the_probability(sample, encoders, booster, row_encoder):
     """One booster call yields probability and explanation; they must be
     consistent by construction, not by coincidence."""
-    from src.serving.app import sigmoid
+    from src.serving.predictor import sigmoid
 
     raw = booster.get_booster()
     names = list(row_encoder.feature_names)

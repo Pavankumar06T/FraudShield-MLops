@@ -1,0 +1,89 @@
+# FraudShield local stack.
+#
+# Redpanda rather than Kafka: Kafka-API compatible, a single Go binary with
+# no JVM and no ZooKeeper/KRaft controller to run alongside it. On an 8 GB
+# machine already holding the 799-tree model, MLflow, and a 700 MB dataset,
+# a JVM broker plus its coordinator is most of the remaining headroom.
+# Redpanda here is capped at 512 MB and one core.
+#
+#   docker compose up -d redpanda
+#   docker compose --profile ui up -d          # adds the console on :8090
+#   docker compose --profile app up -d         # adds the scoring service
+#
+#   python -m src.streaming.producer --rate 50
+#   python -m src.streaming.consumer
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: fraudshield-redpanda
+    command:
+      - redpanda
+      - start
+      # --overprovisioned tells Redpanda it is sharing the box rather than
+      # owning it, which disables the busy-poll it uses on dedicated
+      # hardware. Without it a single broker will sit at 100% of a core
+      # while completely idle.
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --default-log-level=warn
+      - --node-id=0
+      - --check=false
+      # Two listeners: containers reach the broker as redpanda:29092, the
+      # host reaches it as localhost:9092. A single advertised address
+      # cannot satisfy both, and getting this wrong produces a client that
+      # connects, fetches metadata, and then hangs trying to reach a
+      # hostname it cannot resolve.
+      - --kafka-addr=INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      - --advertise-kafka-addr=INTERNAL://redpanda:29092,EXTERNAL://localhost:9092
+    ports:
+      - "9092:9092"    # Kafka API
+      - "9644:9644"    # admin / metrics
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    mem_limit: 900m
+
+  # Optional. Useful for watching the topic fill, not needed to run anything.
+  console:
+    image: redpandadata/console:v2.7.2
+    container_name: fraudshield-console
+    profiles: ["ui"]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+    mem_limit: 300m
+
+  # Optional. The scoring service, for running the whole loop in containers.
+  # Mounts the MLflow store read-only rather than baking a model into the
+  # image -- see the Dockerfile for why.
+  api:
+    build: .
+    container_name: fraudshield-api
+    profiles: ["app"]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./mlflow.db:/app/mlflow.db:ro
+      - ./mlartifacts:/app/mlartifacts:ro
+      - ./reports:/app/reports
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:29092
+    mem_limit: 1500m
+
+volumes:
+  redpanda-data:

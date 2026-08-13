@@ -24,7 +24,9 @@ from src.training.train import (
     XGB_HYPERPARAMETERS,
     best_f1_threshold,
     ensemble_proba,
+    eval_history,
     evaluate,
+    format_eval_history,
     evaluate_proba,
     positive_proba,
     scale_pos_weight,
@@ -401,6 +403,127 @@ def test_early_stopping_rounds_really_is_gone_from_fit():
     assert "early_stopping_rounds" not in parameters
     assert "eval_set" in parameters
     assert "callbacks" in parameters
+
+
+def imbalanced_with_stop(n: int = 16_000, seed: int = 12):
+    """A frame shaped like the real problem: rare positives, real signal.
+
+    The imbalance is the point. scale_pos_weight inflates probabilities, so
+    binary_logloss gets monotonically worse from round 1 while average
+    precision is still climbing -- the condition that stopped the real run
+    at a single tree.
+    """
+    rng = np.random.default_rng(seed)
+    signal = rng.normal(size=n)
+    y = pd.Series((rng.random(n) < 1 / (1 + np.exp(-(signal * 1.6 - 4.0)))).astype(int))
+    X = pd.DataFrame(
+        {"a": signal, "b": rng.normal(size=n), "c": rng.normal(size=n)}
+    )
+    cut = int(n * 0.85)
+    return X[:cut], y[:cut], X[cut:], y[cut:]
+
+
+def test_lightgbm_does_not_stop_at_one_tree_under_imbalance():
+    """The regression that mattered: PR-AUC 0.3759 and zero rows flagged.
+
+    binary_logloss peaks at round 1 under scale_pos_weight and the callback
+    halts when ANY monitored metric stalls, so the fit died immediately. A
+    model that stops in single digits here is misconfigured, not trained.
+    """
+    Xf, yf, Xs, ys = imbalanced_with_stop()
+    assert yf.mean() < 0.10 and ys.sum() > 50  # genuinely imbalanced, enough signal
+
+    model = train_lightgbm(Xf, yf, Xs, ys)
+    assert model.best_iteration_ > 10, (
+        f"stopped at {model.best_iteration_} trees -- binary_logloss is being "
+        "monitored again, or first_metric_only was dropped"
+    )
+    # and it produces a usable ranking rather than an all-negative constant
+    assert (positive_proba(model, Xs) >= 0.5).sum() > 0
+
+
+def test_lightgbm_monitors_average_precision_alone():
+    """binary_logloss must be suppressed, not merely deprioritised.
+
+    objective='binary' adds it by default and eval_metric APPENDS rather
+    than replaces, so without naming the metric explicitly both are watched.
+    """
+    assert LGB_HYPERPARAMETERS["metric"] == LGB_EVAL_METRIC
+
+    Xf, yf, Xs, ys = imbalanced_with_stop(n=6_000)
+    history = eval_history(train_lightgbm(Xf, yf, Xs, ys))
+    assert list(history) == [LGB_EVAL_METRIC], (
+        f"monitoring {list(history)}; binary_logloss will stop the fit at round 1"
+    )
+
+
+def test_lightgbm_callback_sets_first_metric_only(monkeypatch):
+    """Second belt. Pinned on the keywords, because a build that watches one
+    metric anyway would let the flag's removal pass unnoticed."""
+    import lightgbm as lgb
+
+    captured: dict = {}
+    original = lgb.LGBMClassifier.fit
+
+    def spy(self, X, y, **kwargs):
+        captured.update(kwargs)
+        return original(self, X, y, **kwargs)
+
+    monkeypatch.setattr(lgb.LGBMClassifier, "fit", spy)
+    Xf, yf, Xs, ys = learnable_with_stop(n=1_200)
+    train_lightgbm(Xf, yf, Xs, ys)
+
+    callbacks = captured["callbacks"]
+    assert callbacks
+    assert any(getattr(cb, "first_metric_only", False) for cb in callbacks), (
+        "no early-stopping callback with first_metric_only=True"
+    )
+
+
+def test_xgboost_monitors_only_aucpr():
+    """XGBoost replaces the default metric rather than appending, so it has
+    no equivalent failure -- asserted rather than assumed."""
+    Xf, yf, Xs, ys = imbalanced_with_stop(n=6_000)
+    assert list(eval_history(train_model(Xf, yf, Xs, ys))) == ["aucpr"]
+
+
+# --------------------------------------------------------------------------
+# Eval history
+# --------------------------------------------------------------------------
+
+
+def test_eval_history_normalises_both_libraries():
+    """LightGBM exposes an attribute, XGBoost a method, each nested under a
+    different eval-set name."""
+    Xf, yf, Xs, ys = learnable_with_stop(n=1_200)
+    for model in (train_model(Xf, yf, Xs, ys), train_lightgbm(Xf, yf, Xs, ys)):
+        history = eval_history(model)
+        assert history
+        assert all(isinstance(v, list) and v for v in history.values())
+
+
+def test_eval_history_is_empty_without_an_eval_set():
+    X, y = learnable(n=1_200)
+    assert eval_history(train_lightgbm(X, y)) == {}
+    assert "no eval history" in format_eval_history(train_lightgbm(X, y))
+
+
+def test_history_flags_a_metric_that_peaks_at_round_one():
+    """The tell that diagnosed the bug has to survive in the output."""
+
+    class Stub:
+        evals_result_ = {
+            "valid_0": {
+                "average_precision": [0.1, 0.2, 0.3, 0.4],
+                "binary_logloss": [0.20, 0.25, 0.30, 0.35],
+            }
+        }
+
+    text = format_eval_history(Stub(), rounds=4)
+    assert "binary_logloss best at round 1" in text
+    assert "would stop the fit immediately" in text
+    assert "average_precision best at round 4" in text
+    assert "would stop the fit immediately" not in text.split("binary_logloss")[0]
 
 
 def test_trees_used_handles_both_index_conventions():

@@ -172,6 +172,16 @@ LGB_HYPERPARAMETERS: dict[str, object] = {
     "colsample_bytree": 0.8,
     "min_child_weight": 1e-3,
     "objective": "binary",
+    # Load-bearing. objective="binary" makes LightGBM monitor binary_logloss
+    # by default, and eval_metric in fit APPENDS rather than replaces -- so
+    # both metrics get watched. Under scale_pos_weight the probabilities are
+    # deliberately uncalibrated, so logloss is best at round 1 and degrades
+    # monotonically from there while average precision is still climbing.
+    # The early-stopping callback halts when ANY monitored metric stalls, so
+    # logloss killed the fit at one tree: PR-AUC 0.3759, zero rows flagged
+    # at 0.5. Naming the metric here suppresses binary_logloss entirely;
+    # first_metric_only=True on the callback is the second belt.
+    "metric": "average_precision",
     "n_jobs": -1,
     "random_state": 42,
     "verbose": -1,
@@ -444,11 +454,74 @@ def train_lightgbm(
             eval_metric=LGB_EVAL_METRIC,
             callbacks=[
                 lgb.early_stopping(
-                    stopping_rounds=EARLY_STOPPING_ROUNDS, verbose=False
+                    stopping_rounds=EARLY_STOPPING_ROUNDS,
+                    verbose=False,
+                    # Stop on average precision alone. Without this the
+                    # callback halts as soon as ANY monitored metric stops
+                    # improving -- see the note on "metric" above.
+                    first_metric_only=True,
                 )
             ],
         )
     return model
+
+
+def eval_history(model) -> dict[str, list[float]]:
+    """Per-round validation scores, normalised across the two libraries.
+
+    LightGBM exposes ``evals_result_`` as an attribute, XGBoost
+    ``evals_result()`` as a method, and each nests under its own name for
+    the eval set. Returns ``{metric: [score per round]}``.
+    """
+    if hasattr(model, "evals_result_"):
+        results = model.evals_result_
+    elif hasattr(model, "evals_result"):
+        results = model.evals_result()
+    else:
+        return {}
+    if not results:
+        return {}
+    first = next(iter(results.values()))
+    return {name: list(scores) for name, scores in first.items()}
+
+
+def format_eval_history(model, rounds: int = 10) -> str:
+    """Render the first few boosting rounds, and where each metric peaked.
+
+    Worth printing every run. A model that stops at one tree and a model
+    that stops at four hundred look identical in the summary table until
+    you can see whether the monitored metric was still climbing when the
+    fit was halted.
+    """
+    history = eval_history(model)
+    if not history:
+        return "    (no eval history -- fitted without an eval set)"
+
+    names = list(history)
+    lines = [
+        f"    monitored: {', '.join(names)}",
+        "    " + f"{'round':>6}" + "".join(f"{name:>22}" for name in names),
+    ]
+    for index in range(min(rounds, len(history[names[0]]))):
+        lines.append(
+            f"    {index + 1:>6}"
+            + "".join(f"{history[name][index]:>22.6f}" for name in names)
+        )
+
+    for name in names:
+        scores = np.asarray(history[name])
+        lower_is_better = "loss" in name or "error" in name
+        best = int(np.argmin(scores) if lower_is_better else np.argmax(scores)) + 1
+        direction = "lower is better" if lower_is_better else "higher is better"
+        flag = (
+            "   <-- peaks at round 1; this metric would stop the fit immediately"
+            if best == 1
+            else ""
+        )
+        lines.append(
+            f"    {name} best at round {best} of {len(scores)} ({direction}){flag}"
+        )
+    return "\n".join(lines)
 
 
 #: Backwards-compatible alias: train_model was the single-model entry point.
@@ -655,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
         "member_probability_correlation": correlation,
     }
 
+    fitted = {"xgboost": xgb_model, "lightgbm": lgb_model}
     for name, block in blocks.items():
         print(_format_metrics(block["val"], name))
         if block.get("n_trees_used"):
@@ -667,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"  trees used {block['n_trees_used']:,} of "
                 f"{block['n_estimators_ceiling']:,}{ceiling_note}"
             )
+            print(f"\n  early-stopping history:\n{format_eval_history(fitted[name])}\n")
         print(
             f"  train PR-AUC {block['train']['pr_auc']:.4f} vs val "
             f"{block['val']['pr_auc']:.4f}  (gap {block['overfit_gap_pr_auc']:+.4f})"

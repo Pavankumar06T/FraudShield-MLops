@@ -60,9 +60,19 @@ def promotion_description() -> str:
     lines += [
         f"  train/val gap  +{float(reference['overfit_gap_pr_auc']):.4f}",
         f"  trees used     {int(reference['n_trees_used'])} of 2000 (early stopped)",
+        f"  n_jobs         {reference.get('n_jobs')} (pinned)",
         "",
-        "Promoted over the depth-6 configuration, which scored 0.5291 at a "
-        "+0.2734 gap: 0.0036 of PR-AUC traded for 0.0802 of overfit gap.",
+        "Promoted over the depth-6 configuration on a comparison where both ran "
+        "at the same thread count: 0.5291 at a +0.2734 gap against 0.5255 at "
+        "+0.1932, trading 0.0036 of PR-AUC for 0.0802 of overfit gap.",
+        "",
+        "The figures above come from a later run at a pinned n_jobs, so they "
+        "differ slightly from that comparison. XGBoost's hist method is not "
+        "thread-deterministic -- its subsample and colsample RNG streams are "
+        "per-thread -- so the same configuration yields 651, 799 or 969 trees "
+        "depending on core count. All score within 0.0023 PR-AUC, a quarter of "
+        "the 0.0080 bootstrap standard error, so none is better; the pin makes "
+        "the choice repeatable. See docs/reproducibility.md.",
         "",
         "NOT comparable to the earlier 0.5477 figure, which was trained on the "
         "full 319,927-row split with no early-stopping carve. The entire "

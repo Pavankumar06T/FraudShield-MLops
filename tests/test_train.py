@@ -25,6 +25,8 @@ from src.training.train import (
     _format_reference_check,
     LGB_HYPERPARAMETERS,
     N_ESTIMATORS_CEILING,
+    N_JOBS,
+    THREAD_DETERMINISM_FINDING,
     XGB_HYPERPARAMETERS,
     best_f1_threshold,
     ensemble_proba,
@@ -614,11 +616,52 @@ def test_production_config_is_depth4_reg():
     assert XGB_HYPERPARAMETERS["early_stopping_rounds"] == EARLY_STOPPING_ROUNDS == 50
 
 
-def test_reference_baseline_holds_the_depth4_reg_figures():
-    assert REFERENCE_BASELINE["pr_auc"] == pytest.approx(0.5255)
-    assert REFERENCE_BASELINE["roc_auc"] == pytest.approx(0.8938)
-    assert REFERENCE_BASELINE["overfit_gap_pr_auc"] == pytest.approx(0.1932)
-    assert REFERENCE_BASELINE["n_trees_used"] == 651
+def test_reference_baseline_holds_the_pinned_local_figures():
+    """The reference is the pinned-thread local run, not the Colab one."""
+    assert REFERENCE_BASELINE["pr_auc"] == pytest.approx(0.5248)
+    assert REFERENCE_BASELINE["roc_auc"] == pytest.approx(0.8917)
+    assert REFERENCE_BASELINE["overfit_gap_pr_auc"] == pytest.approx(0.2177)
+    assert REFERENCE_BASELINE["n_trees_used"] == 799
+    assert REFERENCE_BASELINE["n_jobs"] == N_JOBS
+
+
+def test_reference_records_the_thread_count_it_was_measured_at():
+    """Without it the figure is not reproducible, only observed."""
+    assert "n_jobs" in REFERENCE_BASELINE["regime"]
+    assert REFERENCE_BASELINE["n_jobs"] != -1
+
+
+def test_unpinned_runs_are_in_history_and_marked_unreproducible():
+    """Both the 651 Colab figure and the 969 local one must survive as
+    record, and neither may be usable as a bar."""
+    by_trees = {e["n_trees_used"]: e for e in BASELINE_HISTORY if "n_trees_used" in e}
+
+    colab = by_trees[651]
+    assert colab["pr_auc"] == pytest.approx(0.5255)
+    assert colab["comparable_to_current"] is False
+    assert "not reproducible" in colab["why_not"]
+    assert "unpinned" in colab["regime"]["n_jobs"]
+
+    local = by_trees[969]
+    assert local["pr_auc"] == pytest.approx(0.5271)
+    assert local["comparable_to_current"] is False
+    assert "thread count" in local["why_not"]
+
+
+def test_thread_finding_shows_lightgbm_unchanged_and_xgboost_moving():
+    f = THREAD_DETERMINISM_FINDING
+    lgb_runs = list(f["lightgbm_by_n_jobs"].values())
+    assert len({r["trees"] for r in lgb_runs}) == 1, "LightGBM must be the control"
+    assert len({r["pr_auc"] for r in lgb_runs}) == 1
+
+    xgb_runs = list(f["xgboost_by_n_jobs"].values())
+    assert len({r["trees"] for r in xgb_runs}) == len(xgb_runs), "all differ"
+
+    spread = max(r["pr_auc"] for r in xgb_runs) - min(r["pr_auc"] for r in xgb_runs)
+    assert spread < f["val_pr_auc_bootstrap_std_error"], (
+        "the spread must be inside one standard error -- otherwise thread count "
+        "would be choosing a better model, not just a different one"
+    )
 
 
 def test_superseded_baseline_is_kept_and_marked_non_comparable():
@@ -678,15 +721,15 @@ def test_nothing_compares_against_the_superseded_figures():
 def test_reference_check_reports_a_match():
     text, matches = _format_reference_check(
         {
-            "val": {"pr_auc": 0.5251, "roc_auc": 0.8934,
+            "val": {"pr_auc": 0.5244, "roc_auc": 0.8912,
                     "at_best_f1_threshold": {"f1": 0.5}},
-            "overfit_gap_pr_auc": 0.1940,
-            "n_trees_used": 648,
+            "overfit_gap_pr_auc": 0.2180,
+            "n_trees_used": 799,
         }
     )
     assert matches
     assert "MATCH" in text
-    assert "0.8938" in text and "0.8934" in text  # reference and observed
+    assert "0.8917" in text and "0.8912" in text  # reference and observed
     assert "not yet recorded" not in text
 
 

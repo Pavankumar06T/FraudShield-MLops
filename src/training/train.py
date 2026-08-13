@@ -62,6 +62,8 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
+import platform
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +71,8 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pyarrow
+import sklearn
 import xgboost as xgb
 from sklearn.metrics import (
     average_precision_score,
@@ -111,6 +115,31 @@ EARLY_STOPPING_ROUNDS: int = 50
 #: Tail of train reserved for early stopping, by TransactionDT order.
 ES_HOLDOUT_FRACTION: float = 0.15
 
+#: Fixed thread count for both models. Never -1.
+#:
+#: XGBoost's hist tree method is not thread-deterministic: the subsample and
+#: colsample RNG streams are per-thread, so the thread count changes which
+#: rows and columns each tree sees. Measured with an identical seed and
+#: identical data, only n_jobs differing -- early stopping at 239 / 300 / 140
+#: trees for 1 / 2 / 4 threads, predicted probabilities differing by up to
+#: 0.44. `-1` resolves to the core count of whatever machine happens to run
+#: it, which makes it the one value that cannot be reproduced elsewhere.
+#:
+#: 2 rather than 1 because it is portable -- Colab, GitHub Actions runners
+#: and an 8GB laptop all have at least two cores -- and roughly halves the
+#: wall clock against single-threaded.
+#:
+#: LightGBM measured thread-deterministic (bit-identical at 1 and 4 threads),
+#: so its pin is for symmetry rather than necessity: one knob, one place, and
+#: no need to remember which library needed it.
+#:
+#: This matters beyond tidiness. Phase 6 retrains on GitHub Actions runners
+#: whose core count differs from any development machine. Unpinned, a
+#: drift-triggered retrain would produce a model differing for reasons having
+#: nothing to do with the drift, and the Phase 7 shadow A/B would be
+#: comparing thread counts as much as models. See docs/reproducibility.md.
+N_JOBS: int = 2
+
 #: The promoted reference: XGBoost under the depth4_reg regularization,
 #: measured on the real splits (272k reduced train, 98k val). Kept as a
 #: fixed point so a later run that diverges is visible immediately -- a
@@ -119,12 +148,20 @@ ES_HOLDOUT_FRACTION: float = 0.15
 #: downstream comparison meaningless. Promote a new figure here only
 #: deliberately, never as a side effect.
 #:
+#: Measured locally at the pinned thread count, which is what makes it a
+#: reference rather than an observation: rerunning this configuration on this
+#: machine reproduces these figures exactly, and on any machine reproduces
+#: them to within the thread-independent parts.
 REFERENCE_BASELINE: dict[str, float | None] = {
-    "pr_auc": 0.5255,
-    "roc_auc": 0.8938,
-    "overfit_gap_pr_auc": 0.1932,
-    "n_trees_used": 651,
-    "regime": "depth4_reg, early stopping on a 15% temporal carve of train",
+    "pr_auc": 0.5248,
+    "roc_auc": 0.8917,
+    "overfit_gap_pr_auc": 0.2177,
+    "n_trees_used": 799,
+    "n_jobs": N_JOBS,
+    "regime": (
+        "depth4_reg, early stopping on a 15% temporal carve of train, "
+        f"n_jobs={N_JOBS} pinned"
+    ),
 }
 
 #: How far a rerun may drift from the reference before it is called out.
@@ -166,11 +203,90 @@ BASELINE_HISTORY: tuple[dict, ...] = (
             "early_stopping": True,
             "temporal_carve": True,
             "max_depth": 6,
+            "n_jobs": "unpinned (-1)",
         },
         "comparable_to_current": True,
         "why_not": None,
     },
+    {
+        "label": "depth4_reg, Colab, unpinned threads",
+        "pr_auc": 0.5255,
+        "roc_auc": 0.8938,
+        "overfit_gap_pr_auc": 0.1932,
+        "n_trees_used": 651,
+        "regime": {
+            "train_rows": 271_938,
+            "n_estimators": N_ESTIMATORS_CEILING,
+            "early_stopping": True,
+            "temporal_carve": True,
+            "max_depth": 4,
+            "n_jobs": "unpinned (-1), Colab core count unknown",
+        },
+        "comparable_to_current": False,
+        "why_not": (
+            "Ran with n_jobs=-1, which resolves to the core count of whatever "
+            "machine executes it. XGBoost's hist method is not "
+            "thread-deterministic -- its subsample and colsample RNG streams are "
+            "per-thread -- so this 651-tree figure is not reproducible even on "
+            "Colab: a different runner would give a different tree count. It was "
+            "the promoted reference until the thread count was pinned. Kept as "
+            "the record of what was measured, not as a target."
+        ),
+    },
+    {
+        "label": "depth4_reg, local, unpinned threads (4 cores)",
+        "pr_auc": 0.5271,
+        "roc_auc": 0.8915,
+        "overfit_gap_pr_auc": 0.2343,
+        "n_trees_used": 969,
+        "regime": {
+            "train_rows": 271_938,
+            "n_estimators": N_ESTIMATORS_CEILING,
+            "early_stopping": True,
+            "temporal_carve": True,
+            "max_depth": 4,
+            "n_jobs": "unpinned (-1), resolved to 4",
+        },
+        "comparable_to_current": False,
+        "why_not": (
+            "Same configuration and same data as the current reference, differing "
+            "only in thread count: 4 rather than the pinned 2. That alone moved "
+            "the model from 799 trees to 969. Not reproducible on a machine with "
+            "a different core count."
+        ),
+    },
 )
+
+#: What pinning the thread count actually bought, measured on the real split.
+#:
+#: The same configuration and data, varying only n_jobs, produced three
+#: different XGBoost models. All three score within 0.0023 PR-AUC of each
+#: other -- comfortably inside the +/-0.0080 bootstrap standard error on the
+#: 98,305-row val split -- so none is better; they are the same model quality
+#: reached by different row and column samples.
+#:
+#: LightGBM was identical to every digit across thread counts, which is the
+#: control: it shows the variation is XGBoost's sampling RNG rather than
+#: anything about the data or the pipeline.
+THREAD_DETERMINISM_FINDING: dict[str, object] = {
+    "measured_on": "real splits, 271,938 reduced train / 98,305 val",
+    "xgboost_by_n_jobs": {
+        "2 (pinned)": {"trees": 799, "pr_auc": 0.5248, "gap": 0.2177},
+        "4 (unpinned local)": {"trees": 969, "pr_auc": 0.5271, "gap": 0.2343},
+        "unknown (unpinned Colab)": {"trees": 651, "pr_auc": 0.5255, "gap": 0.1932},
+    },
+    "lightgbm_by_n_jobs": {
+        "2 (pinned)": {"trees": 624, "pr_auc": 0.5239, "gap": 0.1932},
+        "4 (unpinned local)": {"trees": 624, "pr_auc": 0.5239, "gap": 0.1932},
+    },
+    "val_pr_auc_bootstrap_std_error": 0.0080,
+    "conclusion": (
+        "XGBoost's tree count and predictions depend on thread count; LightGBM's "
+        "do not. The spread across thread counts (0.0023 PR-AUC) is a quarter of "
+        "one standard error, so no thread count produces a better model -- only "
+        "a different one. Pinning makes the choice reproducible."
+    ),
+}
 
 #: The measurement that makes the two regimes non-comparable, from the
 #: config comparison on real data.
@@ -228,7 +344,7 @@ XGB_HYPERPARAMETERS: dict[str, object] = {
     # scale_pos_weight deliberately destroys. Stopping on it would optimise
     # something this model is not trying to be good at.
     "eval_metric": "aucpr",
-    "n_jobs": -1,
+    "n_jobs": N_JOBS,
     "random_state": 42,
 }
 
@@ -273,7 +389,7 @@ LGB_HYPERPARAMETERS: dict[str, object] = {
     # at 0.5. Naming the metric here suppresses binary_logloss entirely;
     # first_metric_only=True on the callback is the second belt.
     "metric": "average_precision",
-    "n_jobs": -1,
+    "n_jobs": N_JOBS,
     "random_state": 42,
     "verbose": -1,
 }
@@ -491,14 +607,24 @@ def train_xgboost(
     y: pd.Series,
     X_stop: pd.DataFrame | None = None,
     y_stop: pd.Series | None = None,
+    n_jobs: int | None = None,
 ) -> xgb.XGBClassifier:
     """Fit XGBoost, stopping on the carved slice when one is supplied.
 
     ``early_stopping_rounds`` belongs in the constructor for XGBoost 2.0+;
     passing it to ``fit`` raises. With no stopping slice the ceiling is
     trained out in full, which is only useful for tests.
+
+    ``n_jobs`` is a correctness knob here, not only a speed one. XGBoost's
+    hist method is not thread-deterministic: with an identical seed and
+    identical data, 1, 2 and 4 threads produced early stops at 239, 300 and
+    140 trees and predicted probabilities differing by up to 0.44. Pin it to
+    reproduce a run on another machine. LightGBM is unaffected -- measured
+    bit-identical across thread counts.
     """
     params = dict(XGB_HYPERPARAMETERS)
+    if n_jobs is not None:
+        params["n_jobs"] = n_jobs
     if X_stop is None:
         params.pop("early_stopping_rounds", None)
 
@@ -515,6 +641,7 @@ def train_lightgbm(
     y: pd.Series,
     X_stop: pd.DataFrame | None = None,
     y_stop: pd.Series | None = None,
+    n_jobs: int | None = None,
 ) -> lgb.LGBMClassifier:
     """Fit LightGBM on the identical features, weighting and stopping rule.
 
@@ -532,9 +659,10 @@ def train_lightgbm(
     that pair exists in some patched builds only, and the substitution
     raises TypeError everywhere else.
     """
-    model = lgb.LGBMClassifier(
-        **LGB_HYPERPARAMETERS, scale_pos_weight=scale_pos_weight(y)
-    )
+    params = dict(LGB_HYPERPARAMETERS)
+    if n_jobs is not None:
+        params["n_jobs"] = n_jobs
+    model = lgb.LGBMClassifier(**params, scale_pos_weight=scale_pos_weight(y))
     if X_stop is None:
         model.fit(X, y)
     else:
@@ -760,6 +888,37 @@ def _model_block(
 MLFLOW_FLAVOURS: dict[str, str] = {"xgboost": "xgboost", "lightgbm": "lightgbm"}
 
 
+def environment_params(n_jobs_override: int | None = None) -> dict[str, object]:
+    """Everything about the machine that can change the fitted model.
+
+    Logged on every run so a divergence is attributable from the record
+    alone rather than reconstructed months later. ``cpu_count`` and the
+    effective ``n_jobs`` are here because XGBoost's hist method is not
+    thread-deterministic -- two runs identical in every other respect will
+    disagree if they used different thread counts, and without these
+    parameters there is nothing in the record that says so.
+
+    pandas is here for the opposite reason: it was the first suspect for a
+    divergence it turned out not to cause, and the version is cheap to
+    record and expensive to reconstruct.
+    """
+    effective = n_jobs_override if n_jobs_override is not None else XGB_HYPERPARAMETERS["n_jobs"]
+    detected = os.cpu_count() or 1
+    return {
+        "env.python": platform.python_version(),
+        "env.platform": platform.platform(),
+        "env.cpu_count": detected,
+        "env.n_jobs_requested": effective,
+        "env.n_jobs_effective": detected if effective in (-1, None) else effective,
+        "env.xgboost": xgb.__version__,
+        "env.lightgbm": lgb.__version__,
+        "env.pandas": pd.__version__,
+        "env.numpy": np.__version__,
+        "env.sklearn": sklearn.__version__,
+        "env.pyarrow": pyarrow.__version__,
+    }
+
+
 def log_training_runs(
     blocks: dict[str, dict],
     fitted: dict[str, object],
@@ -862,6 +1021,27 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip experiment tracking (it is already skipped when MLflow is absent)",
     )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help=(
+            "fit and report but write nothing. For reproducibility experiments: "
+            "overwriting models/ while the registry describes a different model "
+            "is how the two silently disagree."
+        ),
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "override thread count for both models. XGBoost's hist method is "
+            "NOT thread-deterministic -- the same seed and data give different "
+            "models at different thread counts -- so pin this to reproduce a run "
+            "across machines. LightGBM is unaffected."
+        ),
+    )
     args = parser.parse_args(argv)
     sampling = args.sample is not None
 
@@ -912,17 +1092,33 @@ def main(argv: list[str] | None = None) -> int:
         f"\n  {X_fit.shape[1]} features, scale_pos_weight {weight:.2f} "
         f"recomputed from the reduced train, applied to both models"
     )
+    env = environment_params(args.n_jobs)
+    print(
+        f"  threads {env['env.n_jobs_effective']} of {env['env.cpu_count']} "
+        f"(n_jobs={env['env.n_jobs_requested']})"
+        # Keyed off the effective value, not off whether the CLI flag was
+        # passed: with N_JOBS pinned in the config, a run without the flag is
+        # still reproducible, and saying otherwise would be false.
+        + (
+            "  <-- UNPINNED; XGBoost is not thread-deterministic, so this run\n"
+            "      is not reproducible on a machine with a different core count"
+            if env["env.n_jobs_requested"] in (-1, None)
+            else "  (pinned, reproducible)"
+        )
+        + f"\n  pandas {pd.__version__}, xgboost {xgb.__version__}, "
+        f"lightgbm {lgb.__version__}"
+    )
 
     print(
         f"\n  fitting XGBoost  (ceiling {N_ESTIMATORS_CEILING:,}, patience "
         f"{EARLY_STOPPING_ROUNDS}, monitoring aucpr) ..."
     )
-    xgb_model = train_xgboost(X_fit, y_fit, X_stop, y_stop)
+    xgb_model = train_xgboost(X_fit, y_fit, X_stop, y_stop, n_jobs=args.n_jobs)
     print(
         f"  fitting LightGBM (ceiling {N_ESTIMATORS_CEILING:,}, patience "
         f"{EARLY_STOPPING_ROUNDS}, monitoring {LGB_EVAL_METRIC}) ..."
     )
-    lgb_model = train_lightgbm(X_fit, y_fit, X_stop, y_stop)
+    lgb_model = train_lightgbm(X_fit, y_fit, X_stop, y_stop, n_jobs=args.n_jobs)
 
     blocks: dict[str, dict] = {
         "xgboost": _model_block(
@@ -1046,6 +1242,7 @@ def main(argv: list[str] | None = None) -> int:
         # regime behind it; none is a bar for the current run.
         "baseline_history": list(BASELINE_HISTORY),
         "carve_cost_finding": CARVE_COST_FINDING,
+        "thread_determinism_finding": THREAD_DETERMINISM_FINDING,
         "models": blocks,
         "best_by_pr_auc": max(blocks, key=lambda n: blocks[n]["val"]["pr_auc"]),
         "environment": {
@@ -1062,6 +1259,14 @@ def main(argv: list[str] | None = None) -> int:
             "A sampled run is not a baseline -- every later phase compares "
             "against this\nfile, and models trained on a slice would set the "
             "bar in the wrong place.\nRe-run without --sample to persist."
+        )
+        return 0
+
+    if args.no_save:
+        print(
+            "\nNOT saving models, encoders or metrics (--no-save). Nothing on "
+            "disk changed,\nso the registered model and its companion artifacts "
+            "stay consistent."
         )
         return 0
 
@@ -1127,9 +1332,7 @@ def main(argv: list[str] | None = None) -> int:
         "early_stopping.rounds": EARLY_STOPPING_ROUNDS,
         "early_stopping.encoders_fitted_on": "reduced train only",
         "early_stopping.val_used_for_stopping": False,
-        "env.xgboost": xgb.__version__,
-        "env.lightgbm": lgb.__version__,
-        "env.pandas": pd.__version__,
+        **environment_params(args.n_jobs),
     }
     run_ids = log_training_runs(
         blocks,

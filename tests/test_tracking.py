@@ -137,13 +137,24 @@ def test_flattening_survives_the_real_metric_shape():
 
 
 def test_description_reports_the_promoted_figures():
+    """Sourced from the constant, so a reference change cannot leave the
+    registry describing a model nobody trained."""
     text = promotion_description()
     assert f"{float(REFERENCE_BASELINE['pr_auc']):.4f}" in text
     assert f"{float(REFERENCE_BASELINE['roc_auc']):.4f}" in text
-    assert "+0.1932" in text
-    assert "651" in text
+    assert f"+{float(REFERENCE_BASELINE['overfit_gap_pr_auc']):.4f}" in text
+    assert str(int(REFERENCE_BASELINE["n_trees_used"])) in text
     assert "depth4_reg" in text
     assert "15% temporal carve" in text
+
+
+def test_description_records_the_pinned_thread_count():
+    """A tree count without the thread count that produced it is not
+    reproducible information."""
+    text = promotion_description()
+    assert f"n_jobs         {REFERENCE_BASELINE['n_jobs']} (pinned)" in text
+    assert "not\nthread-deterministic" in text or "thread-deterministic" in text
+    assert "651, 799 or 969" in text
 
 
 def test_description_warns_against_the_superseded_figure():
@@ -157,8 +168,8 @@ def test_description_warns_against_the_superseded_figure():
 def test_description_survives_a_pending_roc_auc(monkeypatch):
     monkeypatch.setitem(REFERENCE_BASELINE, "roc_auc", None)
     text = promotion_description()
-    assert "PR-AUC" in text and "0.5255" in text
-    assert "ROC-AUC" not in text
+    assert f"{float(REFERENCE_BASELINE['pr_auc']):.4f}" in text
+    assert "ROC-AUC " not in text
 
 
 def test_every_stage_has_an_alias():

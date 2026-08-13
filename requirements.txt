@@ -40,3 +40,7 @@ shap>=0.45
 
 # --- Testing ---
 pytest>=8.0
+
+# --- Serving ---
+fastapi>=0.110
+uvicorn[standard]>=0.27

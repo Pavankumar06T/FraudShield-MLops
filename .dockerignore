@@ -1,0 +1,25 @@
+# The data is ~700 MB and the service never reads it.
+data/
+.dvc/cache/
+
+# Model binaries come from the registry at startup, not from the image.
+models/
+mlruns/
+
+# Local tooling
+.venv/
+.git/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+notebooks/
+tests/
+docs/
+
+# mlflow.db and mlartifacts/ are mounted at run time rather than copied --
+# baking them in would freeze the promoted model into the image.
+mlflow.db
+mlflow.db-journal
+mlartifacts/

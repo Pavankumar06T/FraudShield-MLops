@@ -16,9 +16,13 @@ import pytest
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.training.train import (
+    BASELINE_HISTORY,
+    CARVE_COST_FINDING,
     DEFAULT_THRESHOLD,
     EARLY_STOPPING_ROUNDS,
     LGB_EVAL_METRIC,
+    REFERENCE_BASELINE,
+    _format_reference_check,
     LGB_HYPERPARAMETERS,
     N_ESTIMATORS_CEILING,
     XGB_HYPERPARAMETERS,
@@ -574,16 +578,131 @@ def test_scale_pos_weight_is_recomputed_from_the_reduced_train():
 
 
 def test_lightgbm_config_matches_xgboost_where_it_must():
-    """Two settings silently diverge if left at LightGBM's defaults.
+    """Three settings silently diverge if left at LightGBM's defaults.
 
     num_leaves: LightGBM grows leaf-wise, so max_depth alone does not bound
-    tree size. subsample_freq: without it >= 1, `subsample` does nothing.
+    tree size -- at max_depth=4 the default 31 permits trees far wider than
+    a depth-4 level-wise tree, making the regularization nominal.
+    subsample_freq: without it >= 1, `subsample` does nothing.
+    min_child_weight: LightGBM defaults to 1e-3 against XGBoost's 1, so
+    leaving it alone is a far weaker constraint rather than an equal one.
     """
     assert LGB_HYPERPARAMETERS["num_leaves"] == 2 ** XGB_HYPERPARAMETERS["max_depth"]
+    assert LGB_HYPERPARAMETERS["num_leaves"] == 16
     assert LGB_HYPERPARAMETERS["subsample_freq"] >= 1
     for shared in ("n_estimators", "max_depth", "learning_rate", "subsample",
-                   "colsample_bytree", "random_state"):
-        assert LGB_HYPERPARAMETERS[shared] == XGB_HYPERPARAMETERS[shared]
+                   "colsample_bytree", "min_child_weight", "reg_lambda",
+                   "random_state"):
+        assert LGB_HYPERPARAMETERS[shared] == XGB_HYPERPARAMETERS[shared], shared
+
+
+# --------------------------------------------------------------------------
+# The promoted configuration and the baselines it supersedes
+# --------------------------------------------------------------------------
+
+
+def test_production_config_is_depth4_reg():
+    """The promotion, pinned. 0.5255 val PR-AUC at a +0.1932 gap on real
+    data -- 0.0036 of score for 0.0802 of gap."""
+    assert XGB_HYPERPARAMETERS["max_depth"] == 4
+    assert XGB_HYPERPARAMETERS["min_child_weight"] == 10
+    assert XGB_HYPERPARAMETERS["subsample"] == pytest.approx(0.8)
+    assert XGB_HYPERPARAMETERS["colsample_bytree"] == pytest.approx(0.6)
+    assert XGB_HYPERPARAMETERS["reg_lambda"] == pytest.approx(10.0)
+    # early stopping retained at the same ceiling and patience
+    assert XGB_HYPERPARAMETERS["n_estimators"] == N_ESTIMATORS_CEILING == 2000
+    assert XGB_HYPERPARAMETERS["early_stopping_rounds"] == EARLY_STOPPING_ROUNDS == 50
+
+
+def test_reference_baseline_holds_the_depth4_reg_figures():
+    assert REFERENCE_BASELINE["pr_auc"] == pytest.approx(0.5255)
+    assert REFERENCE_BASELINE["overfit_gap_pr_auc"] == pytest.approx(0.1932)
+    assert REFERENCE_BASELINE["n_trees_used"] == 651
+    # ROC-AUC was never recorded for this configuration; a placeholder number
+    # would be worse than an explicit gap
+    assert REFERENCE_BASELINE["roc_auc"] is None
+
+
+def test_superseded_baseline_is_kept_and_marked_non_comparable():
+    """0.5477 must survive as history, and must be unusable as a bar."""
+    entry = next(e for e in BASELINE_HISTORY if e["pr_auc"] == pytest.approx(0.5477))
+    assert entry["roc_auc"] == pytest.approx(0.9031)
+    assert entry["comparable_to_current"] is False
+    assert entry["why_not"]
+    assert entry["regime"]["train_rows"] == 319_927
+    assert entry["regime"]["temporal_carve"] is False
+    assert entry["regime"]["early_stopping"] is False
+
+
+def test_history_entries_all_name_their_regime():
+    for entry in BASELINE_HISTORY:
+        assert entry["label"] and entry["regime"]
+        assert "train_rows" in entry["regime"]
+        if not entry["comparable_to_current"]:
+            assert entry["why_not"], f"{entry['label']} needs a reason"
+
+
+def test_carve_cost_finding_is_internally_consistent():
+    """The measurement that makes the two regimes non-comparable.
+
+    carve_probe and depth6_current both scored 0.5291, so the entire drop
+    from 0.5477 is the 48k removed rows and early stopping cost nothing.
+    """
+    f = CARVE_COST_FINDING
+    assert f["reduced_train_fixed_400_pr_auc"] == f["reduced_train_early_stopped_pr_auc"]
+    assert f["carve_cost_pr_auc"] == pytest.approx(
+        f["reduced_train_fixed_400_pr_auc"] - f["full_train_fixed_400_pr_auc"], abs=1e-6
+    )
+    assert f["early_stopping_cost_pr_auc"] == pytest.approx(
+        f["reduced_train_early_stopped_pr_auc"] - f["reduced_train_fixed_400_pr_auc"],
+        abs=1e-6,
+    )
+    assert f["early_stopping_cost_pr_auc"] == pytest.approx(0.0)
+
+
+def test_nothing_compares_against_the_superseded_figures():
+    """The old numbers are recorded, not used. If a run were measured
+    against 0.5477 it would look like a regression when it is really 48k
+    fewer training rows."""
+    assert REFERENCE_BASELINE["pr_auc"] != pytest.approx(0.5477)
+    reference = _format_reference_check(
+        {
+            "val": {"pr_auc": 0.5255, "roc_auc": 0.91,
+                    "at_best_f1_threshold": {"f1": 0.5}},
+            "overfit_gap_pr_auc": 0.1932,
+            "n_trees_used": 651,
+        }
+    )[0]
+    assert "0.5477" not in reference
+    assert "0.5255" in reference
+
+
+def test_reference_check_reports_a_match_and_asks_for_the_roc_auc():
+    text, matches = _format_reference_check(
+        {
+            "val": {"pr_auc": 0.5251, "roc_auc": 0.8874,
+                    "at_best_f1_threshold": {"f1": 0.5}},
+            "overfit_gap_pr_auc": 0.1940,
+            "n_trees_used": 648,
+        }
+    )
+    assert matches
+    assert "MATCH" in text
+    assert 'REFERENCE_BASELINE["roc_auc"] = 0.8874' in text
+
+
+def test_reference_check_flags_a_real_divergence():
+    text, matches = _format_reference_check(
+        {
+            "val": {"pr_auc": 0.4100, "roc_auc": 0.85,
+                    "at_best_f1_threshold": {"f1": 0.4}},
+            "overfit_gap_pr_auc": 0.30,
+            "n_trees_used": 120,
+        }
+    )
+    assert not matches
+    assert "DIVERGED" in text
+    assert "NOT updated automatically" in text
 
 
 def test_lightgbm_trains_and_beats_the_floor():

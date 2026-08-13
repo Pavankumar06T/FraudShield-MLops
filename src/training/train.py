@@ -98,26 +98,6 @@ XGB_MODEL_PATH: Path = MODELS_DIR / "baseline_xgb.json"
 LGB_MODEL_PATH: Path = MODELS_DIR / "baseline_lgb.txt"
 METRICS_PATH: Path = REPORTS_DIR / "baseline_metrics.json"
 
-#: The promoted reference: the first full XGBoost run on the real splits.
-#: Kept as a fixed point so a later run that diverges is visible immediately
-#: -- a changed feature pipeline, a re-split, or a training-regime change
-#: would all move these, and silently redefining the baseline would make
-#: every downstream comparison meaningless. Promote a new figure here only
-#: deliberately, never as a side effect.
-REFERENCE_BASELINE: dict[str, float] = {"pr_auc": 0.5477, "roc_auc": 0.9031}
-
-#: How far a rerun may drift from the reference before it is called out.
-REFERENCE_TOLERANCE: float = 0.01
-
-#: Val PR-AUC from the previous fixed-400-tree regime, for all three models.
-#: Printed beside the current numbers so the effect of early stopping is
-#: directly visible rather than inferred.
-FIXED_400_PR_AUC: dict[str, float] = {
-    "xgboost": 0.5477,
-    "lightgbm": 0.5482,
-    "ensemble": 0.5513,
-}
-
 #: Ceiling, not a target. Early stopping picks the actual tree count; this
 #: only needs to be high enough that it never binds.
 N_ESTIMATORS_CEILING: int = 2000
@@ -130,14 +110,123 @@ EARLY_STOPPING_ROUNDS: int = 50
 #: Tail of train reserved for early stopping, by TransactionDT order.
 ES_HOLDOUT_FRACTION: float = 0.15
 
+#: The promoted reference: XGBoost under the depth4_reg regularization,
+#: measured on the real splits (272k reduced train, 98k val). Kept as a
+#: fixed point so a later run that diverges is visible immediately -- a
+#: changed feature pipeline, a re-split, or a training-regime change would
+#: all move it, and silently redefining the baseline would make every
+#: downstream comparison meaningless. Promote a new figure here only
+#: deliberately, never as a side effect.
+#:
+#: roc_auc is pending: the promotion decision was made on PR-AUC and the
+#: overfit gap, and the ROC-AUC for this configuration has not been recorded
+#: yet. The next full run prints the observed value and asks for it to be
+#: filled in. Until then the divergence check runs on PR-AUC alone rather
+#: than inventing a number.
+REFERENCE_BASELINE: dict[str, float | None] = {
+    "pr_auc": 0.5255,
+    "roc_auc": None,
+    "overfit_gap_pr_auc": 0.1932,
+    "n_trees_used": 651,
+    "regime": "depth4_reg, early stopping on a 15% temporal carve of train",
+}
+
+#: How far a rerun may drift from the reference before it is called out.
+REFERENCE_TOLERANCE: float = 0.01
+
+#: Superseded baselines, kept so the numbers are not lost and NOT so they
+#: can be compared against. Each entry names the regime that produced it,
+#: because a score is only meaningful alongside the data and budget behind
+#: it. Nothing in the code reads these for comparison.
+BASELINE_HISTORY: tuple[dict, ...] = (
+    {
+        "label": "fixed-400, full train, no carve",
+        "pr_auc": 0.5477,
+        "roc_auc": 0.9031,
+        "overfit_gap_pr_auc": 0.2488,
+        "regime": {
+            "train_rows": 319_927,
+            "n_estimators": 400,
+            "early_stopping": False,
+            "temporal_carve": False,
+            "max_depth": 6,
+        },
+        "comparable_to_current": False,
+        "why_not": (
+            "Trained on all 319,927 rows. The current regime holds back 15% of "
+            "train as an early-stopping slice, and that missing 48k rows -- not "
+            "the change in tree count or depth -- accounts for the entire "
+            "difference in score. See CARVE_COST_FINDING."
+        ),
+    },
+    {
+        "label": "depth6 + early stopping, carved train",
+        "pr_auc": 0.5291,
+        "overfit_gap_pr_auc": 0.2734,
+        "n_trees_used": 364,
+        "regime": {
+            "train_rows": 271_938,
+            "n_estimators": N_ESTIMATORS_CEILING,
+            "early_stopping": True,
+            "temporal_carve": True,
+            "max_depth": 6,
+        },
+        "comparable_to_current": True,
+        "why_not": None,
+    },
+)
+
+#: The measurement that makes the two regimes non-comparable, from the
+#: config comparison on real data.
+#:
+#: carve_probe -- fixed 400 trees at depth 6 on the *reduced* train, i.e.
+#: the old settings with 48k fewer rows -- scored 0.5291. depth6_current,
+#: which differs only by early stopping, scored 0.5291 as well. Identical to
+#: four decimals. So the whole 0.5477 -> 0.5291 drop is the carve, and early
+#: stopping cost nothing at all.
+#:
+#: This is why the fixed-400 figure lives in history rather than as a bar:
+#: any run under the current regime is measured on 15% less training data,
+#: and would have to be better in order to look equal.
+CARVE_COST_FINDING: dict[str, object] = {
+    "measured_on": "real splits, 271,938 reduced train / 98,305 val",
+    "full_train_fixed_400_pr_auc": 0.5477,
+    "reduced_train_fixed_400_pr_auc": 0.5291,
+    "reduced_train_early_stopped_pr_auc": 0.5291,
+    "carve_cost_pr_auc": -0.0186,
+    "early_stopping_cost_pr_auc": 0.0000,
+    "conclusion": (
+        "The entire drop from 0.5477 came from the 48k rows the temporal carve "
+        "removed. Early stopping cost nothing -- it reached the same score with "
+        "364 trees instead of 400."
+    ),
+}
+
+#: The promoted depth4_reg configuration. Early stopping alone did not close
+#: the overfit gap -- it moved from +0.2488 to +0.2734 while using 364 of
+#: 2000 trees, so tree count was never the binding constraint and was never
+#: going to be the fix. Depth and feature width were.
+#:
+#: Measured against depth6 on the same carved split: 0.5291 -> 0.5255 val
+#: PR-AUC, a loss of 0.0036, for a gap of +0.2734 -> +0.1932, a reduction of
+#: 0.0802. Roughly 30% less overfitting for a third of a percent of score.
 XGB_HYPERPARAMETERS: dict[str, object] = {
     "n_estimators": N_ESTIMATORS_CEILING,
     "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
-    "max_depth": 6,
+    # Shallower trees: the single largest contributor to the gap.
+    "max_depth": 4,
     "learning_rate": 0.05,
     "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 1,
+    # Narrower column sampling. With 431 features, most of them anonymised
+    # V-columns, 0.8 lets any given tree see almost everything.
+    "colsample_bytree": 0.6,
+    # A real floor on leaf weight, so a leaf cannot be carved out of a
+    # handful of positives. XGBoost's default of 1 is no constraint at a
+    # 3.4% base rate.
+    "min_child_weight": 10,
+    # L2 well above XGBoost's default of 1.0 -- "non-zero" is the default,
+    # not a choice.
+    "reg_lambda": 10.0,
     "tree_method": "hist",
     # aucpr, not logloss: logloss rewards calibrated probabilities, which
     # scale_pos_weight deliberately destroys. Stopping on it would optimise
@@ -153,10 +242,15 @@ XGB_HYPERPARAMETERS: dict[str, object] = {
 #:
 #: * ``num_leaves`` -- LightGBM grows leaf-wise, so ``max_depth`` alone does
 #:   not bound tree size the way it does in XGBoost's level-wise growth.
-#:   2**6 = 64 makes the capacity comparable; leaving the default 31 would
-#:   quietly hand LightGBM a smaller model.
+#:   Setting max_depth=4 without touching num_leaves leaves the default 31,
+#:   which permits trees far wider than a depth-4 level-wise tree: the
+#:   regularization would be nominal. 2**4 = 16 is the matching bound.
 #: * ``subsample_freq`` -- LightGBM ignores ``subsample`` entirely unless
 #:   this is >= 1. Without it, row subsampling silently does nothing.
+#: * ``min_child_weight`` -- both libraries mean minimum summed hessian in a
+#:   leaf, so 10 transfers directly. Note LightGBM's default is 1e-3 against
+#:   XGBoost's 1, so leaving it alone would have been a far weaker
+#:   constraint, not an equal one.
 #:
 #: Early stopping is a fit-time callback here rather than a constructor
 #: argument, which is why it does not appear in this dict. LightGBM 4.x
@@ -164,13 +258,14 @@ XGB_HYPERPARAMETERS: dict[str, object] = {
 #: replacement.
 LGB_HYPERPARAMETERS: dict[str, object] = {
     "n_estimators": N_ESTIMATORS_CEILING,
-    "max_depth": 6,
-    "num_leaves": 64,
+    "max_depth": 4,
+    "num_leaves": 16,
     "learning_rate": 0.05,
     "subsample": 0.8,
     "subsample_freq": 1,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 1e-3,
+    "colsample_bytree": 0.6,
+    "min_child_weight": 10,
+    "reg_lambda": 10.0,
     "objective": "binary",
     # Load-bearing. objective="binary" makes LightGBM monitor binary_logloss
     # by default, and eval_metric in fit APPENDS rather than replaces -- so
@@ -559,31 +654,90 @@ def _format_metrics(metrics: dict, title: str) -> str:
 
 
 def _format_comparison(blocks: dict[str, dict]) -> str:
-    """Side-by-side across all three models, against the fixed-400 regime."""
+    """Side-by-side across all three models.
+
+    Deliberately carries no column for the superseded fixed-400 figures.
+    Those came from a regime with 48k more training rows, so a per-row delta
+    against them would read as a regression when it is a difference in
+    training data -- exactly the comparison BASELINE_HISTORY exists to
+    prevent. The reference line below compares like with like.
+    """
     lines = [
         "",
-        "=" * 78,
-        f"  {'model':<11}{'trees':>7}{'/ ceiling':>11}{'PR-AUC':>9}"
-        f"{'was @400':>10}{'delta':>9}{'ROC-AUC':>10}{'train gap':>11}",
-        "  " + "-" * 74,
+        "=" * 76,
+        f"  {'model':<11}{'trees':>7}{'/ ceiling':>11}{'PR-AUC':>9}{'lift':>8}"
+        f"{'ROC-AUC':>10}{'best F1':>9}{'train gap':>11}",
+        "  " + "-" * 72,
     ]
     for name, block in blocks.items():
         val = block["val"]
-        previous = FIXED_400_PR_AUC.get(name)
         used = block.get("n_trees_used")
         ceiling = block.get("n_estimators_ceiling")
-        trees = f"{used:,}" if used else "-"
-        against = f"{ceiling:,}" if ceiling else "-"
-        was = f"{previous:.4f}" if previous is not None else "-"
-        delta = f"{val['pr_auc'] - previous:+.4f}" if previous is not None else "-"
         lines.append(
-            f"  {name:<11}{trees:>7}{against:>11}{val['pr_auc']:>9.4f}"
-            f"{was:>10}{delta:>9}{val['roc_auc']:>10.4f}"
+            f"  {name:<11}{f'{used:,}' if used else '-':>7}"
+            f"{f'{ceiling:,}' if ceiling else '-':>11}"
+            f"{val['pr_auc']:>9.4f}{val['pr_auc_lift_over_floor']:>7.1f}x"
+            f"{val['roc_auc']:>10.4f}{val['at_best_f1_threshold']['f1']:>9.4f}"
             f"{block['overfit_gap_pr_auc']:>+11.4f}"
         )
     best = max(blocks, key=lambda name: blocks[name]["val"]["pr_auc"])
-    lines += ["  " + "-" * 74, f"  best by PR-AUC: {best}", "=" * 78]
+    lines += ["  " + "-" * 72, f"  best by PR-AUC: {best}", "=" * 76]
     return "\n".join(lines)
+
+
+def _format_reference_check(block: dict) -> tuple[str, bool]:
+    """Compare the XGBoost run against the promoted reference.
+
+    Returns the rendered text and whether PR-AUC landed within tolerance.
+    ROC-AUC is reported rather than checked while the reference value is
+    still pending -- a check against a number nobody recorded would either
+    always pass or always fail, and neither means anything.
+    """
+    val = block["val"]
+    expected = float(REFERENCE_BASELINE["pr_auc"])
+    delta = val["pr_auc"] - expected
+    matches = abs(delta) <= REFERENCE_TOLERANCE
+
+    lines = [
+        "",
+        f"  reference ({REFERENCE_BASELINE['regime']}):",
+        f"    PR-AUC     {expected:.4f}        this run {val['pr_auc']:.4f}  "
+        f"({delta:+.4f})  {'MATCH' if matches else 'DIVERGED'}",
+    ]
+
+    reference_gap = REFERENCE_BASELINE.get("overfit_gap_pr_auc")
+    if reference_gap is not None:
+        gap_delta = block["overfit_gap_pr_auc"] - float(reference_gap)
+        lines.append(
+            f"    train gap  {float(reference_gap):+.4f}       this run "
+            f"{block['overfit_gap_pr_auc']:+.4f}  ({gap_delta:+.4f})"
+        )
+
+    reference_trees = REFERENCE_BASELINE.get("n_trees_used")
+    if reference_trees and block.get("n_trees_used"):
+        lines.append(
+            f"    trees      {int(reference_trees):,}           this run "
+            f"{block['n_trees_used']:,}"
+        )
+
+    if REFERENCE_BASELINE.get("roc_auc") is None:
+        lines.append(
+            f"    ROC-AUC    not yet recorded.  this run {val['roc_auc']:.4f}\n"
+            "               If this run is the promoted configuration, set\n"
+            f'               REFERENCE_BASELINE["roc_auc"] = {val["roc_auc"]:.4f}'
+        )
+    else:
+        lines.append(
+            f"    ROC-AUC    {float(REFERENCE_BASELINE['roc_auc']):.4f}        "
+            f"this run {val['roc_auc']:.4f}"
+        )
+
+    if not matches:
+        lines.append(
+            "    Something upstream changed -- the feature pipeline, the split, or\n"
+            "    the library versions. The constant is NOT updated automatically."
+        )
+    return "\n".join(lines), matches
 
 
 def _model_block(
@@ -767,21 +921,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     observed = blocks["xgboost"]["val"]
-    reference_delta = observed["pr_auc"] - REFERENCE_BASELINE["pr_auc"]
-    matches = abs(reference_delta) <= REFERENCE_TOLERANCE
-    print(
-        f"\n  reference XGBoost baseline: PR-AUC {REFERENCE_BASELINE['pr_auc']:.4f} / "
-        f"ROC-AUC {REFERENCE_BASELINE['roc_auc']:.4f}\n"
-        f"  this run:                   PR-AUC {observed['pr_auc']:.4f} / "
-        f"ROC-AUC {observed['roc_auc']:.4f}  ({reference_delta:+.4f})"
-    )
-    if not matches and not sampling:
-        print(
-            "  DIVERGED from the reference. Early stopping changed the training\n"
-            "  regime, so a shift here is expected rather than alarming -- but the\n"
-            "  constant is NOT updated automatically. Promote the new figure in\n"
-            "  REFERENCE_BASELINE only once you have decided it is the better bar."
-        )
+    reference_delta = observed["pr_auc"] - float(REFERENCE_BASELINE["pr_auc"])
+    reference_text, matches = _format_reference_check(blocks["xgboost"])
+    print(reference_text)
 
     record = {
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -817,11 +959,15 @@ def main(argv: list[str] | None = None) -> int:
             **REFERENCE_BASELINE,
             "observed_xgboost_pr_auc": observed["pr_auc"],
             "observed_xgboost_roc_auc": observed["roc_auc"],
+            "observed_xgboost_gap": blocks["xgboost"]["overfit_gap_pr_auc"],
             "pr_auc_delta": float(reference_delta),
             "within_tolerance": bool(matches),
             "tolerance": REFERENCE_TOLERANCE,
         },
-        "previous_fixed_400_pr_auc": FIXED_400_PR_AUC,
+        # Superseded figures, recorded so they are not lost. Each names the
+        # regime behind it; none is a bar for the current run.
+        "baseline_history": list(BASELINE_HISTORY),
+        "carve_cost_finding": CARVE_COST_FINDING,
         "models": blocks,
         "best_by_pr_auc": max(blocks, key=lambda n: blocks[n]["val"]["pr_auc"]),
         "environment": {

@@ -49,6 +49,7 @@ from src.common.config import (
 )
 from src.features.build_features import build_features, read_split
 from src.training.train import (
+    CARVE_COST_FINDING,
     ES_HOLDOUT_FRACTION,
     N_ESTIMATORS_CEILING,
     XGB_HYPERPARAMETERS,
@@ -60,9 +61,12 @@ from src.training.train import (
 
 COMPARISON_PATH: Path = REPORTS_DIR / "config_comparison.json"
 
-#: Val PR-AUC of the original fixed-400-tree run on the FULL train split.
-#: Every row is measured against this.
-FIXED_400_PR_AUC: float = 0.5477
+#: Val PR-AUC and gap of the original fixed-400-tree run on the FULL train
+#: split. Sourced from the finding rather than restated, so there is one
+#: place to correct. Used only to attribute the carve cost -- it is not a
+#: bar any current run should be measured against, since it saw 48k more
+#: training rows.
+FIXED_400_PR_AUC: float = float(CARVE_COST_FINDING["full_train_fixed_400_pr_auc"])
 FIXED_400_GAP: float = 0.2488
 
 #: Beyond this, carve_probe cannot plausibly be measuring the same data the
@@ -72,30 +76,37 @@ IMPLAUSIBLE_CARVE_DELTA: float = 0.15
 
 #: Overrides applied on top of XGB_HYPERPARAMETERS. ``early_stopping`` False
 #: trains the stated tree count out in full.
+#:
+#: Note the pre-promotion settings are now spelled out explicitly rather
+#: than inherited. XGB_HYPERPARAMETERS is the depth4_reg configuration, so
+#: an empty override no longer reproduces the old regime -- carve_probe in
+#: particular must restate depth 6, min_child_weight 1, colsample 0.8 and
+#: reg_lambda 1.0 or it stops being a measurement of the original run.
 CONFIGS: dict[str, dict] = {
-    # Not a candidate -- a measurement. Same settings that produced 0.5477,
+    # Not a candidate -- a measurement. The settings that produced 0.5477,
     # trained on the reduced split, so the drop is attributable to the carve
     # rather than to anything else in the comparison.
     "carve_probe": {
         "early_stopping": False,
         "n_estimators": 400,
         "max_depth": 6,
+        "min_child_weight": 1,
+        "colsample_bytree": 0.8,
+        "reg_lambda": 1.0,
     },
-    # What the current code does, for continuity with the reported numbers.
-    "depth6_current": {},
-    # Shallower trees, a real child-weight floor so leaves cannot be carved
-    # from a handful of positives, narrower column sampling, and L2 well
-    # above XGBoost's default of 1.0.
-    "depth4_reg": {
-        "max_depth": 4,
-        "min_child_weight": 10,
-        "subsample": 0.8,
-        "colsample_bytree": 0.6,
-        "reg_lambda": 10.0,
+    # The superseded depth-6 configuration, kept so the promotion can be
+    # re-derived rather than taken on trust.
+    "depth6_legacy": {
+        "max_depth": 6,
+        "min_child_weight": 1,
+        "colsample_bytree": 0.8,
+        "reg_lambda": 1.0,
     },
-    # The same direction, pushed further. Included to show where the curve
-    # turns -- if this one loses PR-AUC without closing the gap further,
-    # depth4_reg is near the useful limit.
+    # The promoted default. Empty because it IS XGB_HYPERPARAMETERS now.
+    "production": {},
+    # The same direction pushed further -- never completed on real data
+    # (Colab disconnected), so whether depth4_reg is near the useful limit
+    # is still unmeasured.
     "depth3_strong": {
         "max_depth": 3,
         "min_child_weight": 30,
@@ -104,6 +115,14 @@ CONFIGS: dict[str, dict] = {
         "reg_lambda": 50.0,
         "reg_alpha": 1.0,
     },
+}
+
+#: What the real-data comparison produced, for reference when re-running.
+#: depth3_strong is absent because it never finished.
+MEASURED_ON_REAL_DATA: dict[str, dict] = {
+    "carve_probe": {"n_trees_used": 400, "val_pr_auc": 0.5291, "gap": 0.2855},
+    "depth6_legacy": {"n_trees_used": 364, "val_pr_auc": 0.5291, "gap": 0.2734},
+    "production": {"n_trees_used": 651, "val_pr_auc": 0.5255, "gap": 0.1932},
 }
 
 
@@ -196,7 +215,7 @@ def summarise(rows: list[dict]) -> str:
     lines = [""]
 
     probe = by_name.get("carve_probe")
-    current = by_name.get("depth6_current")
+    current = by_name.get("depth6_legacy")
     if probe:
         # Signed the same way as the table's "vs .5477" column throughout:
         # negative is worse than the bar. Reporting a loss as a positive
@@ -221,10 +240,15 @@ def summarise(rows: list[dict]) -> str:
             total_delta = current["val_pr_auc"] - FIXED_400_PR_AUC
             stopping_delta = total_delta - carve_delta
             lines.append(
-                f"  Total drop to depth6_current: {total_delta:+.4f}, of which "
+                f"  Total drop to depth6_legacy: {total_delta:+.4f}, of which "
                 f"{carve_delta:+.4f} is the carve and {stopping_delta:+.4f} is "
                 "early stopping choosing fewer trees."
             )
+            if abs(stopping_delta) < 0.001:
+                lines.append(
+                    "  Early stopping cost nothing -- it reached the same score on "
+                    "fewer trees."
+                )
 
     candidates = [row for row in rows if row["config"] != "carve_probe"]
     if candidates:

@@ -616,11 +616,9 @@ def test_production_config_is_depth4_reg():
 
 def test_reference_baseline_holds_the_depth4_reg_figures():
     assert REFERENCE_BASELINE["pr_auc"] == pytest.approx(0.5255)
+    assert REFERENCE_BASELINE["roc_auc"] == pytest.approx(0.8938)
     assert REFERENCE_BASELINE["overfit_gap_pr_auc"] == pytest.approx(0.1932)
     assert REFERENCE_BASELINE["n_trees_used"] == 651
-    # ROC-AUC was never recorded for this configuration; a placeholder number
-    # would be worse than an explicit gap
-    assert REFERENCE_BASELINE["roc_auc"] is None
 
 
 def test_superseded_baseline_is_kept_and_marked_non_comparable():
@@ -677,7 +675,25 @@ def test_nothing_compares_against_the_superseded_figures():
     assert "0.5255" in reference
 
 
-def test_reference_check_reports_a_match_and_asks_for_the_roc_auc():
+def test_reference_check_reports_a_match():
+    text, matches = _format_reference_check(
+        {
+            "val": {"pr_auc": 0.5251, "roc_auc": 0.8934,
+                    "at_best_f1_threshold": {"f1": 0.5}},
+            "overfit_gap_pr_auc": 0.1940,
+            "n_trees_used": 648,
+        }
+    )
+    assert matches
+    assert "MATCH" in text
+    assert "0.8938" in text and "0.8934" in text  # reference and observed
+    assert "not yet recorded" not in text
+
+
+def test_reference_check_asks_for_a_missing_roc_auc(monkeypatch):
+    """The pending-value path stays exercised: a placeholder ROC-AUC would
+    make the check either always pass or always fail."""
+    monkeypatch.setitem(REFERENCE_BASELINE, "roc_auc", None)
     text, matches = _format_reference_check(
         {
             "val": {"pr_auc": 0.5251, "roc_auc": 0.8874,
@@ -686,8 +702,7 @@ def test_reference_check_reports_a_match_and_asks_for_the_roc_auc():
             "n_trees_used": 648,
         }
     )
-    assert matches
-    assert "MATCH" in text
+    assert matches  # PR-AUC alone still decides
     assert 'REFERENCE_BASELINE["roc_auc"] = 0.8874' in text
 
 

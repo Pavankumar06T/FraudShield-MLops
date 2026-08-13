@@ -6,9 +6,21 @@
 # the premise (see memory: fraudshield-dataset-decision).
 
 # --- Data handling ---
+# MLflow 3 pins pandas<3, so installing it downgrades a pandas 3.x
+# environment to the 2.x line. Both are supported here: the categorical
+# selector in build_features keys off `not is_numeric_dtype` rather than
+# is_object_dtype precisely because strings arrive as `object` under pandas
+# 2 and as `str` under pandas 3. Verified against both.
 pandas>=2.2
 numpy>=1.26
 pyarrow>=15.0
+
+# --- Experiment tracking and data versioning ---
+# The SQLite tracking store needs no server. It is required rather than
+# preferred: MLflow 3 refuses the legacy mlruns/ file store by default, and
+# the Model Registry has never worked against it.
+mlflow>=3.0
+dvc>=3.0
 
 # --- Modelling ---
 scikit-learn>=1.4

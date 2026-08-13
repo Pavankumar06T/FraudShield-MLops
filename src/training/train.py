@@ -93,6 +93,7 @@ from src.features.build_features import (
     build_features,
     read_split,
 )
+from src.training import tracking
 
 XGB_MODEL_PATH: Path = MODELS_DIR / "baseline_xgb.json"
 LGB_MODEL_PATH: Path = MODELS_DIR / "baseline_lgb.txt"
@@ -118,14 +119,9 @@ ES_HOLDOUT_FRACTION: float = 0.15
 #: downstream comparison meaningless. Promote a new figure here only
 #: deliberately, never as a side effect.
 #:
-#: roc_auc is pending: the promotion decision was made on PR-AUC and the
-#: overfit gap, and the ROC-AUC for this configuration has not been recorded
-#: yet. The next full run prints the observed value and asks for it to be
-#: filled in. Until then the divergence check runs on PR-AUC alone rather
-#: than inventing a number.
 REFERENCE_BASELINE: dict[str, float | None] = {
     "pr_auc": 0.5255,
-    "roc_auc": None,
+    "roc_auc": 0.8938,
     "overfit_gap_pr_auc": 0.1932,
     "n_trees_used": 651,
     "regime": "depth4_reg, early stopping on a 15% temporal carve of train",
@@ -759,6 +755,83 @@ def _model_block(
     }
 
 
+#: MLflow flavour per model. The ensemble has none -- it is an average, not
+#: an object -- so it logs metrics and its members' run ids instead.
+MLFLOW_FLAVOURS: dict[str, str] = {"xgboost": "xgboost", "lightgbm": "lightgbm"}
+
+
+def log_training_runs(
+    blocks: dict[str, dict],
+    fitted: dict[str, object],
+    shared_params: dict[str, object],
+    artifacts: list[Path],
+) -> dict[str, str]:
+    """Record one MLflow run per model. Returns {model: run_id} for those logged.
+
+    Siblings rather than parent and children: each run carries the whole data
+    description, so it can be reproduced from its own record without needing
+    the others to still exist.
+
+    Every call is a no-op when MLflow is unavailable -- see src.training.tracking.
+    """
+    run_ids: dict[str, str] = {}
+    for name, block in blocks.items():
+        with tracking.start_run(
+            run_name=f"{name}-baseline",
+            tags={"model": name, "phase": "baseline", "regime": "depth4_reg"},
+        ) as run:
+            if run is None:
+                continue
+            run_ids[name] = run.info.run_id
+
+            params = dict(shared_params)
+            params["model"] = name
+            for key, value in (block.get("hyperparameters") or {}).items():
+                params[f"hp.{key}"] = value
+            if block.get("members"):
+                params["ensemble.members"] = ",".join(block["members"])
+                params["ensemble.method"] = block.get("method")
+                # Recorded so the ensemble can be rebuilt from its members
+                # rather than merely described.
+                for member in block["members"]:
+                    if member in run_ids:
+                        params[f"ensemble.run_id.{member}"] = run_ids[member]
+            tracking.log_params(run, params)
+
+            metrics: dict[str, float] = {}
+            for prefix, source in (
+                ("val", block["val"]),
+                ("train", block["train"]),
+                ("stop", block.get("stopping_slice")),
+            ):
+                if source:
+                    metrics.update(
+                        {
+                            f"{prefix}.{key}": value
+                            for key, value in tracking.flatten_metrics(source).items()
+                        }
+                    )
+            metrics["overfit_gap_pr_auc"] = block["overfit_gap_pr_auc"]
+            if block.get("n_trees_used"):
+                metrics["n_trees_used"] = float(block["n_trees_used"])
+            if block.get("member_probability_correlation") is not None:
+                metrics["member_probability_correlation"] = float(
+                    block["member_probability_correlation"]
+                )
+            tracking.log_metrics(run, metrics)
+
+            flavour = MLFLOW_FLAVOURS.get(name)
+            if flavour and name in fitted:
+                tracking.log_model(run, fitted[name], flavour)
+
+            # The encoders travel with every model, including the ensemble.
+            # A model without them cannot be served: the ordinal codes it
+            # splits on are meaningless against a differently-fitted mapping.
+            for artifact in artifacts:
+                tracking.log_artifact(run, artifact)
+    return run_ids
+
+
 def _split_summary(name: str, y: pd.Series) -> str:
     return (
         f"    {name:<22}{len(y):>9,} rows  {int(y.sum()):>7,} positive  "
@@ -783,6 +856,11 @@ def main(argv: list[str] | None = None) -> int:
         default=ES_HOLDOUT_FRACTION,
         metavar="F",
         help=f"tail of train reserved for early stopping (default {ES_HOLDOUT_FRACTION})",
+    )
+    parser.add_argument(
+        "--no-mlflow",
+        action="store_true",
+        help="skip experiment tracking (it is already skipped when MLflow is absent)",
     )
     args = parser.parse_args(argv)
     sampling = args.sample is not None
@@ -1023,6 +1101,51 @@ def main(argv: list[str] | None = None) -> int:
         f"{blocks['xgboost']['n_trees_used']:,} / "
         f"{blocks['lightgbm']['n_trees_used']:,} trees"
     )
+
+    if args.no_mlflow:
+        print("\nMLflow logging skipped (--no-mlflow).")
+        return 0
+
+    print(f"\n{tracking.describe_store()}")
+    # Every parameter needed to reproduce the run from its own record: the
+    # exact carve boundary, the size and class balance of each slice, and
+    # the library versions that produced the numbers.
+    shared_params = {
+        "split.cutoff_transaction_dt": cutoff,
+        "split.holdout_fraction_requested": args.holdout_fraction,
+        "split.holdout_fraction_realised": round(realised, 6),
+        "split.train_rows_reduced": len(X_fit),
+        "split.stopping_slice_rows": len(X_stop),
+        "split.val_rows": len(X_val),
+        "split.train_fraud_rate_pct": round(float(y_fit.mean()) * 100, 4),
+        "split.stopping_slice_fraud_rate_pct": round(float(y_stop.mean()) * 100, 4),
+        "split.val_fraud_rate_pct": round(float(y_val.mean()) * 100, 4),
+        "split.n_features": X_fit.shape[1],
+        "split.n_categorical_encoded": len(encoders.categorical_names),
+        "split.scale_pos_weight": round(weight, 6),
+        "early_stopping.ceiling": N_ESTIMATORS_CEILING,
+        "early_stopping.rounds": EARLY_STOPPING_ROUNDS,
+        "early_stopping.encoders_fitted_on": "reduced train only",
+        "early_stopping.val_used_for_stopping": False,
+        "env.xgboost": xgb.__version__,
+        "env.lightgbm": lgb.__version__,
+        "env.pandas": pd.__version__,
+    }
+    run_ids = log_training_runs(
+        blocks,
+        {"xgboost": xgb_model, "lightgbm": lgb_model},
+        shared_params,
+        artifacts=[ENCODERS_PATH, METRICS_PATH],
+    )
+    if run_ids:
+        for name, run_id in run_ids.items():
+            print(f"  logged {name:<9} run {run_id}")
+        record["mlflow"] = {
+            "tracking_uri": tracking.tracking_uri(),
+            "experiment": tracking.EXPERIMENT_NAME,
+            "run_ids": run_ids,
+        }
+        METRICS_PATH.write_text(json.dumps(record, indent=2), encoding="utf-8")
     return 0
 
 

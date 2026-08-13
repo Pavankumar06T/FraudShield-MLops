@@ -1,7 +1,17 @@
-# --- Data & model artifacts (tracked by DVC later, never by git) ---
-# Leading slash anchors these to the repo root. Without it, `data/` would also
-# match the src/data/ source package and silently drop it from version control.
-/data/
+# --- Data: DVC tracks the bytes, git tracks only the .dvc pointers ---
+# Deliberately NOT a blanket `/data/` ignore. That would hide data/*.dvc as
+# well, and those files are the whole point: they carry the content hash
+# that ties a model to the exact bytes it was trained on. DVC writes its own
+# data/.gitignore for the tracked directories; the extension patterns below
+# and in the Python section are the safety net if it ever does not.
+/data/**/*.parquet
+/data/**/*.csv
+/data/**/*.csv.gz
+/data/**/*.zip
+
+# --- Model artifacts and reports (never in git) ---
+# Leading slash anchors these to the repo root. Without it, `models/` would
+# also match any nested directory of that name.
 /models/
 /reports/
 *.parquet
@@ -41,6 +51,10 @@ htmlcov/
 .ipynb_checkpoints/
 
 # --- MLflow (local tracking store) ---
+# mlflow.db is the SQLite backend; mlartifacts/ holds the logged model
+# binaries it points at. Both are run records, not source.
+mlflow.db
+mlflow.db-journal
 mlruns/
 mlartifacts/
 

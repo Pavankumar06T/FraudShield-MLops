@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,7 +52,7 @@ import xgboost as xgb
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from src.common.config import MODELS_DIR
+from src.drift import store
 from src.features.build_features import ENCODERS_PATH, FeatureEncoders
 from src.serving.encoding import RowEncoder
 from src.training import tracking
@@ -211,12 +212,50 @@ class HealthResponse(BaseModel):
 
 STATE: dict[str, Any] = {}
 
+#: Unseen (feature, value) pairs buffered in memory, flushed in batches.
+#:
+#: A category the encoder has never seen is the fastest drift signal there
+#: is -- visible on the first request carrying it, where windowed PSI needs
+#: a window of traffic to move. But a SQLite write inside the request path
+#: would add milliseconds to a 4 ms handler for a signal that does not need
+#: per-request durability, so it is counted here and flushed on a size
+#: trigger and at shutdown.
+UNSEEN_BUFFER: Counter = Counter()
+UNSEEN_FLUSH_EVERY: int = 200
+
+
+def record_unseen(features: list[str], transaction: dict, version: str) -> None:
+    """Buffer unseen levels, flushing when the batch is worth a write."""
+    if not features:
+        return
+    for feature in features:
+        UNSEEN_BUFFER[(feature, str(transaction.get(feature)))] += 1
+    if sum(UNSEEN_BUFFER.values()) >= UNSEEN_FLUSH_EVERY:
+        flush_unseen(version)
+
+
+def flush_unseen(version: str | None = None) -> int:
+    """Persist and clear the buffer. Never fails a request."""
+    if not UNSEEN_BUFFER:
+        return 0
+    try:
+        written = store.record_unseen(dict(UNSEEN_BUFFER), model_version=version)
+    except Exception:
+        # Drift telemetry is not worth a 500. The observations are dropped
+        # rather than retried: the next unseen category will be recorded,
+        # and PSI remains the durable signal.
+        UNSEEN_BUFFER.clear()
+        return 0
+    UNSEEN_BUFFER.clear()
+    return written
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load once, at startup. Per-request loading would dominate latency."""
     STATE["bundle"] = load_bundle()
     yield
+    flush_unseen(STATE.get("bundle").model_version if STATE.get("bundle") else None)
     STATE.clear()
 
 
@@ -302,6 +341,7 @@ def predict(transaction: dict[str, Any], top_factors: int = DEFAULT_TOP_FACTORS)
 
     probability, factors, unseen = score(active, transaction, top_factors)
     decision = "BLOCK" if probability >= active.threshold else "ALLOW"
+    record_unseen(unseen, transaction, active.model_version)
 
     identifier = transaction.get("TransactionID")
     return PredictResponse(
@@ -315,3 +355,35 @@ def predict(transaction: dict[str, Any], top_factors: int = DEFAULT_TOP_FACTORS)
         n_trees=active.n_trees,
         latency_ms=round((time.perf_counter() - started) * 1000, 3),
     )
+
+
+@app.get("/drift/unseen")
+def unseen_summary() -> dict[str, Any]:
+    """Unseen categories seen since startup, buffered plus persisted.
+
+    Exposed so the drift monitor can read the live signal without waiting
+    for a flush, and so an operator can see vocabulary drift arriving
+    without opening the alert store.
+    """
+    active = bundle()
+    buffered = [
+        {"feature": feature, "value": value, "occurrences": count}
+        for (feature, value), count in UNSEEN_BUFFER.most_common(20)
+    ]
+    try:
+        persisted = store.aggregate_unseen()
+    except Exception:
+        persisted = []
+    return {
+        "model_version": active.model_version,
+        "buffered_pending_flush": buffered,
+        "buffered_total": sum(UNSEEN_BUFFER.values()),
+        "persisted": persisted,
+    }
+
+
+@app.post("/drift/flush")
+def flush() -> dict[str, int]:
+    """Force the buffer to the alert store. Called before a monitor run."""
+    active = bundle()
+    return {"written": flush_unseen(active.model_version)}

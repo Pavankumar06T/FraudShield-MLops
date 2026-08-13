@@ -38,6 +38,11 @@ lightgbm>=4.3
 # --- Explainability ---
 shap>=0.45
 
+# --- Drift monitoring ---
+# 0.7.x moved to the Report/Dataset/DataDefinition API; the older
+# ColumnMapping style does not work against it.
+evidently>=0.7
+
 # --- Testing ---
 pytest>=8.0
 

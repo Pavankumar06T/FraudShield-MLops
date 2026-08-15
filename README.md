@@ -284,64 +284,397 @@ bootstrap SE of 0.0080. Pinning buys repeatability, not quality.
 
 ---
 
-## Setup
+## How to run this project
 
-Requires Python 3.12 and Docker.
+Start to finish, in the order that actually works. Steps depend on each other
+— the consumer needs a producer to have published, the shadow comparison needs
+both models to have scored the same rows, the dashboard needs the stores to
+exist.
 
-```bash
-python -m venv .venv && .venv/Scripts/activate     # Linux/macOS: source .venv/bin/activate
-pip install -r requirements.lock.txt
+### 0. Prerequisites
 
-# data lives outside the repo; point at it
-export FRAUDSHIELD_DATA=/path/to/fraudshield/data
-python -m src.common.config                        # prints resolved paths
+| | requirement |
+|---|---|
+| **Python** | 3.12 (developed on 3.12.6; 3.11 should work, untested) |
+| **Docker Desktop** | only for Redpanda in step 6. Everything else runs without it |
+| **RAM** | **8 GB minimum, and that is genuinely the floor** |
+| **Disk** | ~4 GB total |
+| **Cores** | any; `n_jobs` is pinned to 2 regardless — see [Reproducibility](#reproducibility-a-finding-not-a-checkbox) |
+
+On RAM, honestly: this was built on 8 GB / 2 physical cores and it fits, but
+not comfortably. The 120-day retrain peaked at **1.2 GB resident** for the
+Python process alone, with Redpanda holding 133 MB and Docker reserving ~3.9 GB
+of the host. Close other applications before a full retrain. That constraint is
+why the stack is SQLite and Streamlit rather than Postgres, Prometheus and
+Grafana.
+
+Disk, measured on this machine:
+
+```
+  raw Kaggle download   ~1.2 GB   (train_transaction.csv is 652 MB)
+  data/splits             78 MB
+  .dvc/cache              78 MB   (a second copy of the splits)
+  virtualenv             ~2.5 GB  (xgboost, lightgbm, shap, mlflow,
+                                   evidently, streamlit and their trees)
+  mlartifacts             31 MB   grows ~6 MB per registered model
+  reports/                65 MB   mostly drift.db and the Evidently HTML
 ```
 
-`FRAUDSHIELD_DATA` exists so the same code runs locally and against
-Drive-mounted storage on Colab. Nothing outside `src/common/config.py` reads
-it.
-
-### Run
+### 1. Clone and enter
 
 ```bash
-# 1. baseline
+git clone https://github.com/Pavankumar06T/FraudShield-MLops.git
+cd FraudShield-MLops/fraudshield
+```
+
+The Python package lives in the `fraudshield/` subdirectory. Every command
+below is run from there.
+
+### 2. Virtual environment
+
+**PowerShell (Windows)**
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+If activation is blocked:
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`
+
+**bash (Linux/macOS/WSL/Git Bash)**
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+Confirm you are inside it before installing — the single most common failure
+here is installing into the system Python and then wondering why imports fail:
+
+```bash
+python -c "import sys; print(sys.prefix)"    # must contain '.venv'
+```
+
+### 3. Install
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.lock.txt          # exact pins, reproducible
+```
+
+`requirements.txt` holds floors with the reasoning; `requirements.lock.txt`
+holds the exact versions this was verified on. Use the lock file.
+
+Installing takes several minutes — xgboost, lightgbm, shap, mlflow, evidently
+and streamlit are all large.
+
+### 4. Get the data — read this before starting
+
+The dataset is [IEEE-CIS Fraud Detection](https://www.kaggle.com/c/ieee-fraud-detection)
+on Kaggle. Two things to know before you begin:
+
+1. **Kaggle requires phone verification** to download competition data, even
+   for a closed competition. Account → Settings → Phone Verification. There is
+   no way around it and it is not obvious until the download fails.
+2. **You must accept the competition rules** on the competition page, or the
+   API returns 403.
+
+```bash
+pip install kaggle
+# put kaggle.json in ~/.kaggle/ (Windows: %USERPROFILE%\.kaggle\)
+kaggle competitions download -c ieee-fraud-detection -p data/raw
+cd data/raw && unzip ieee-fraud-detection.zip && cd ../..
+```
+
+You need `train_transaction.csv` (652 MB) and `train_identity.csv` (26 MB).
+`test_*.csv` are unlabelled and unused here.
+
+#### Producing the splits — **not automated in this repo**
+
+Stated plainly: **there is no split script in this repository.** `src/data/`
+contains loaders only. The splits were produced once in a Colab notebook
+before the repo existed, and `src/common/config.py` *reads* the resulting
+manifest rather than creating it.
+
+DVC tracks `data/splits` (md5 `09d6c70a…`, 4 files, 81,374,856 bytes) so the
+content is versioned — but **no DVC remote is configured**, so `dvc pull` has
+nowhere to pull from. Cloning this repo does not get you the data.
+
+To reproduce the splits yourself, join the two tables and cut on
+`TransactionDT` sixths:
+
+```python
+import pandas as pd, json
+
+tx = pd.read_csv("data/raw/train_transaction.csv")
+idf = pd.read_csv("data/raw/train_identity.csv")
+df = tx.merge(idf, on="TransactionID", how="left")      # 590,540 x 434
+
+lo, hi = df.TransactionDT.min(), df.TransactionDT.max()
+m3 = lo + (hi - lo) / 6 * 3        # train | val
+m4 = lo + (hi - lo) / 6 * 4        # val   | stream
+
+splits = {"train":  df[df.TransactionDT <  m3],
+          "val":    df[(df.TransactionDT >= m3) & (df.TransactionDT < m4)],
+          "stream": df[df.TransactionDT >= m4]}
+
+meta = {}
+for name, part in splits.items():
+    part.to_parquet(f"data/splits/{name}.parquet", index=False)
+    meta[name] = {"rows": len(part),
+                  "fraud_rate_pct": round(part.isFraud.mean() * 100, 3)}
+
+json.dump({"source": "IEEE-CIS train_transaction + train_identity "
+                     "(left join on TransactionID)",
+           "total_rows": len(df), "total_columns": df.shape[1],
+           "dt_min": float(lo), "dt_max": float(hi),
+           "boundaries": {"month3_end": float(m3), "month4_end": float(m4)},
+           "splits": meta},
+          open("data/splits/split_manifest.json", "w"), indent=2)
+```
+
+You should get 319,927 / 98,305 / 172,308 rows at 3.401% / 3.933% / 3.433%
+fraud. `config.py` re-derives both boundaries from the sixths rule on load and
+raises if the manifest disagrees, so a wrong cut fails loudly.
+
+### 5. Point at the data
+
+```bash
+# bash
+export FRAUDSHIELD_DATA=/absolute/path/to/data
+
+# PowerShell
+$env:FRAUDSHIELD_DATA = "E:\path\to\data"
+
+# Colab, with Drive mounted
+import os; os.environ["FRAUDSHIELD_DATA"] = "/content/drive/MyDrive/fraudshield/data"
+```
+
+Unset, it defaults to `<repo>/data`. Verify before going further:
+
+```bash
+python -m src.common.config
+```
+
+Expect an `x` beside every path that exists, and the split boundaries with row
+counts and fraud rates. If `TRAIN_PARQUET` has no `x`, nothing downstream will
+work.
+
+Other variables, all optional: `MLFLOW_TRACKING_URI` (defaults to
+`sqlite:///mlflow.db`), `MLFLOW_EXPERIMENT_NAME`, `KAFKA_BOOTSTRAP`
+(`localhost:9092`; use `redpanda:29092` from inside a container).
+
+### 6. Run it
+
+Each step says what to expect. Times are from an 8 GB / 2-core machine.
+
+#### 6a. Drift report — the Phase 0 measurement (~6 min)
+
+```bash
+python -m src.drift.report
+```
+
+> `278 stable / 4 moderate / 27 major`, `id_31` top at 1.525, and
+> `17 of the major drifters are missingness-driven`. Writes
+> `reports/psi_report.csv` and `reports/psi_decomposition.csv`.
+
+Optional, but it is the evidence the whole project rests on.
+
+#### 6b. Train the baseline (~25 min)
+
+```bash
 python -m src.training.train
+```
+
+> Temporal carve, then XGBoost and LightGBM, then the comparison table.
+> XGBoost lands at PR-AUC 0.5248 / 799 trees. Writes `models/`,
+> `reports/baseline_metrics.json`, and three MLflow runs.
+
+`--sample 50000` gives a fast smoke test that deliberately **refuses to save**
+— a model fitted on a slice is not a baseline.
+
+#### 6c. Register it
+
+```bash
 python -m src.training.register_model
+```
 
-# 2. serve
-uvicorn src.serving.app:app --port 8080
-curl -s -X POST localhost:8080/predict -H 'Content-Type: application/json' \
-     -d @examples/transaction_fraud.json | python -m json.tool
+> `fraudshield-xgboost` v1 → Staging, `@champion` and `@staging` aliases.
+> Everything downstream resolves the model from the registry, not from disk.
 
-# 3. stream
+#### 6d. Drift monitor (~8 min)
+
+```bash
+python -m src.drift.monitor --window-days 30
+```
+
+> `RETRAIN + INVESTIGATE PIPELINE`, worst feature `id_31`, the two drift types
+> reported separately. Writes alert #1 to `reports/drift.db`,
+> `reports/drift_decision.json`, and a ~7 MB Evidently HTML.
+
+Add `--no-evidently` to skip the HTML if you only want the numbers.
+
+#### 6e. Start Redpanda
+
+```bash
 docker compose up -d redpanda
+docker compose ps                    # wait for (healthy)
+```
+
+> ~133 MB, under 1% CPU idle. Kafka API on `localhost:9092`.
+
+#### 6f. Produce, then consume — **order matters**
+
+```bash
 python -m src.streaming.producer --rate 200 --limit 5000
 python -m src.streaming.consumer --from-beginning --limit 5000
+```
 
-# 4. drift
-python -m src.drift.monitor --window-days 30
+> Producer: `5,000 published in 25.0s (200/s), 0 delivery failures`.
+> Consumer: ~2.6% blocked, ~10% carrying unseen categories, 0 errors.
 
-# 5. retrain + shadow A/B
-python -m src.training.retrain --check-only        # exit 0 if a retrain is due
+The consumer needs messages to already exist. Started first it waits and then
+exits on its idle timeout.
+
+**Use a fresh topic for each experiment.** A new consumer group defaults to
+`auto.offset.reset=earliest`, so pointing one at a reused topic silently
+re-reads the old messages. This caused a real invalid comparison during
+development — see [Common failures](#common-failures).
+
+#### 6g. Serve
+
+```bash
+uvicorn src.serving.app:app --port 8080
+```
+
+> `loaded fraudshield-xgboost v1 @champion`, 799 trees, threshold 0.8018 read
+> from `baseline_metrics.json` — not 0.5.
+
+In another terminal:
+
+```bash
+curl -s localhost:8080/health | python -m json.tool
+
+curl -s -X POST localhost:8080/predict \
+     -H 'Content-Type: application/json' \
+     -d @examples/transaction_fraud.json | python -m json.tool
+```
+
+> `"fraud_probability": 0.999695, "decision": "BLOCK"`, top SHAP factors with
+> categorical codes decoded, `"latency_ms"` around 6–8.
+
+A transaction carrying an unseen browser scores rather than erroring:
+
+```bash
+curl -s -X POST localhost:8080/predict \
+     -H 'Content-Type: application/json' \
+     -d @examples/transaction_unseen_browser.json | python -m json.tool
+```
+
+> `"unseen_categories": ["id_31"]` — the fast drift signal, per request.
+
+#### 6h. Retrain (~75 min at 120 days)
+
+```bash
+python -m src.training.retrain --check-only     # exit 0 if a retrain is due
 python -m src.training.retrain --window-days 120 --end-dt 13219186
-python -m src.serving.compare --promote
+```
 
-# 6. dashboard
+> Names the alert it answers, the window split, `thread pinning verified`,
+> then registers the next version as `@challenger` in **Staging** and marks the
+> alert resolved.
+
+**`--end-dt` is not optional if you intend to run a shadow test.** Without it
+the window runs to the newest data and swallows the rows the comparison will
+judge; the guard then refuses the comparison. Set it below the `TransactionDT`
+you will replay from.
+
+#### 6i. Shadow scoring, then compare
+
+With a challenger registered, the consumer scores every transaction twice
+automatically. Replay rows the challenger has **not** been trained on:
+
+```bash
+python -m src.streaming.producer --rate 0 --start-dt 13219186 \
+       --limit 20000 --topic judged_window
+python -m src.streaming.consumer --topic judged_window --group judged \
+       --from-beginning --limit 20000
+python -m src.serving.compare                    # report only
+python -m src.serving.compare --promote          # promote if it wins
+```
+
+> `PROMOTE` or `no promotion, difference within noise`, with the leakage check
+> stated explicitly: `overlap 0.0%`. Promotion moves the challenger to
+> Production, archives the old champion, and records the verdict.
+
+Exit codes: `0` promoted or reported, `3` refused.
+
+#### 6j. Dashboard
+
+```bash
 streamlit run src/dashboard/app.py
 ```
 
-`--end-dt` is not optional for an honest test — see the limitation below.
+> Five panels at `localhost:8501`. Needs `reports/drift.db` and `mlflow.db` to
+> exist; panels degrade to "nothing recorded yet" rather than erroring.
 
-### Tests
+#### 6k. Tests — runnable without any of the above
 
 ```bash
-pytest -q          # 321 tests
+pytest -q                                        # 321 tests, ~45s
+pytest tests/test_dashboard.py -q                # one module
 ```
 
-They encode the findings rather than the implementation: that missingness
-drift never triggers a retrain, that flipping `isFraud` in a request changes
-nothing, that a 20 SE margin cannot promote a leaked comparison, that the
-dashboard cannot import a PSI function.
+Tests needing the real splits or a trained model skip cleanly when absent, so
+this works on a fresh clone.
+
+### What you can run without the data
+
+| step | works without data? |
+|---|---|
+| `pytest -q` | yes — data-dependent tests skip |
+| `python -m src.common.config` | yes — reports what is missing |
+| everything else | **no** |
+
+There is no bundled sample dataset and no DVC remote. Without the IEEE-CIS
+download you cannot train, monitor, serve, stream or compare.
+
+### Common failures
+
+**`ModuleNotFoundError: No module named 'src'`** — you are not in the
+`fraudshield/` directory, or the venv is not active. Run from the directory
+containing `src/`, and check `python -c "import sys; print(sys.prefix)"`.
+
+**`Split manifest not found`** — `FRAUDSHIELD_DATA` is unset or wrong. The
+error prints the path it resolved to. Run `python -m src.common.config`.
+
+**`error during connect ... docker_engine`** — Docker Desktop is not running.
+Start it and wait for the whale icon to settle before `docker compose up`.
+
+**Consumer scores rows you did not just publish.** A new consumer group starts
+at `auto.offset.reset=earliest` and re-reads the whole topic. During
+development this fed a challenger the *previous* replay batch — rows inside its
+own training window — and produced an invalid comparison that the leakage guard
+caught at 100% overlap. Use `--topic` with a fresh name per experiment.
+
+**`NO VERDICT -- evaluation rows overlap the challenger's training window`** —
+working as intended. The retrain window included the rows being judged. Retrain
+with `--end-dt` below your replay start.
+
+**Colab: everything vanishes after a restart.** The runtime wipes local disk.
+Keep `FRAUDSHIELD_DATA` on mounted Drive, and set
+`MLFLOW_TRACKING_URI=sqlite:////content/drive/MyDrive/fraudshield/mlflow.db`
+so the registry survives too. Otherwise a disconnect loses every registered
+model.
+
+**LightGBM warns about `eval_set` being deprecated.** Harmless, and specific to
+one patched build. `eval_set` is the correct parameter; `eval_X`/`eval_y` raise
+`TypeError` on stock LightGBM.
+
+**Retrain seems to hang with no output.** PowerShell's `Out-File` buffers until
+the process exits, so a redirected log stays empty mid-run. Check the process is
+alive rather than the log.
 
 ---
 

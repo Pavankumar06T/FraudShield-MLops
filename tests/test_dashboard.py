@@ -247,3 +247,94 @@ def test_the_app_does_not_import_the_psi_implementation():
     source = Path("src/dashboard/app.py").read_text(encoding="utf-8")
     for forbidden in ("psi_numeric", "compute_psi_report", "average_precision_score"):
         assert forbidden not in source
+
+
+# --------------------------------------------------------------------------
+# The two PR-AUC figures must both be available and distinguishable
+# --------------------------------------------------------------------------
+
+
+def seed_promotion(db, to_version="4", champion_pr=0.5299, challenger_pr=0.5661):
+    from src.serving.compare import PROMOTION_SCHEMA
+
+    with store.connect(db) as connection:
+        connection.executescript(PROMOTION_SCHEMA)
+        connection.execute(
+            "INSERT INTO model_promotions (promoted_at, from_version, to_version, "
+            "trigger_alert_id, comparison_rows, comparison_positives, "
+            "comparison_fraud_rate, champion_pr_auc, challenger_pr_auc, "
+            "pr_auc_delta, bootstrap_std_error, margin_in_ses, verdict, metrics) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (store.utc_now(), "1", to_version, 2, 11_429, 358, 0.03132,
+             champion_pr, challenger_pr, challenger_pr - champion_pr,
+             0.0085, 4.23, "PROMOTE", "{}"),
+        )
+
+
+def test_shadow_evidence_reports_the_unseen_row_figure(db):
+    """The number that says what the model does in production, as opposed to
+    on the tail of its own training window."""
+    seed_promotion(db)
+    evidence = data.shadow_evidence("4", db)
+
+    assert evidence["available"] is True
+    assert evidence["pr_auc"] == pytest.approx(0.5661)
+    assert evidence["beat_version"] == "1"
+    assert evidence["beat_pr_auc"] == pytest.approx(0.5299)
+    assert evidence["delta"] == pytest.approx(0.0362, abs=1e-3)
+    assert evidence["margin_ses"] == pytest.approx(4.23)
+    assert evidence["rows"] == 11_429
+
+
+def test_shadow_evidence_prefers_the_append_only_table(db):
+    """shadow_comparison.json is overwritten by the next comparison; a
+    promoted model's evidence must not vanish because a later candidate was
+    tested."""
+    seed_promotion(db)
+    assert data.shadow_evidence("4", db)["source"] == "model_promotions"
+
+
+def test_an_untested_model_says_so_rather_than_guessing(db):
+    """Absent evidence must read as absent, not as a number."""
+    seed_promotion(db, to_version="4")
+    assert data.shadow_evidence("99", db).get("available") is not True
+
+
+def test_the_two_figures_are_different_quantities(db):
+    """v4 recorded 0.4834 on its own eval slice and 0.5661 on unseen rows.
+    Showing one alone makes the other look like a contradiction."""
+    seed_promotion(db)
+    shadow = data.shadow_evidence("4", db)["pr_auc"]
+    own_eval = 0.4834
+    assert shadow != pytest.approx(own_eval, abs=0.01)
+
+
+# --------------------------------------------------------------------------
+# Rejections must survive alongside promotions
+# --------------------------------------------------------------------------
+
+
+def test_promotions_table_alone_omits_rejected_challengers(db):
+    """The finding this dashboard exists to avoid repeating: the success
+    path writes a row and the rejection path just returns, so a history
+    built from one source shows an unbroken run of wins."""
+    seed_promotion(db)
+    with store.connect(db) as connection:
+        rows = connection.execute(
+            "SELECT to_version FROM model_promotions"
+        ).fetchall()
+
+    versions_in_table = {r["to_version"] for r in rows}
+    assert "4" in versions_in_table
+    assert "2" not in versions_in_table, (
+        "a rejected challenger never reaches model_promotions -- which is "
+        "exactly why promotion_history must read version tags too"
+    )
+
+
+def test_history_labels_which_source_each_row_came_from(db):
+    """So the omission cannot recur silently."""
+    seed_promotion(db)
+    frame = data.promotion_history(db)
+    assert "source" in frame.columns
+    assert (frame["source"] == "model_promotions").any()

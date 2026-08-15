@@ -368,3 +368,61 @@ def registry_versions() -> pd.DataFrame:
 def latest_shadow() -> dict:
     """The most recent comparison, including its leakage check."""
     return read_json(SHADOW_PATH)
+
+
+def shadow_evidence(version: str, db_path: Path = store.DEFAULT_DB_PATH) -> dict:
+    """What a version scored on rows it had never seen, if it was ever tested.
+
+    A model's own evaluation slice and its shadow-test result measure
+    different windows and routinely disagree -- v4 recorded 0.4834 on the
+    tail of its own training window and 0.5661 on the genuinely unseen rows
+    after it. Shown side by side those two numbers are informative; shown
+    alone, whichever appears looks like the model's accuracy and the other
+    looks like a contradiction.
+
+    Read from ``model_promotions`` in preference to
+    ``shadow_comparison.json``: the table is append-only, while the file is
+    overwritten by the next comparison that runs. A promoted model's
+    evidence should not disappear because someone tested a later candidate.
+    """
+    with store.connect(db_path) as connection:
+        if _table_exists(connection, "model_promotions"):
+            row = connection.execute(
+                "SELECT * FROM model_promotions WHERE to_version = ? "
+                "AND verdict = 'PROMOTE' ORDER BY id DESC LIMIT 1",
+                (str(version),),
+            ).fetchone()
+            if row:
+                return {
+                    "available": True,
+                    "source": "model_promotions",
+                    "pr_auc": row["challenger_pr_auc"],
+                    "beat_version": row["from_version"],
+                    "beat_pr_auc": row["champion_pr_auc"],
+                    "delta": row["pr_auc_delta"],
+                    "margin_ses": row["margin_in_ses"],
+                    "rows": row["comparison_rows"],
+                    "positives": row["comparison_positives"],
+                    "when": row["promoted_at"],
+                }
+
+    # Not promoted, or promoted before the table existed. The latest
+    # comparison may still name it, on either side.
+    latest = read_json(SHADOW_PATH)
+    for role in ("challenger", "champion"):
+        block = latest.get(role) or {}
+        if str(block.get("version")) == str(version):
+            window = latest.get("window", {})
+            return {
+                "available": True,
+                "source": "shadow_comparison.json (latest run only)",
+                "pr_auc": block.get("pr_auc"),
+                "beat_version": None,
+                "beat_pr_auc": None,
+                "delta": latest.get("decision", {}).get("pr_auc_delta"),
+                "margin_ses": latest.get("decision", {}).get("margin_in_ses"),
+                "rows": window.get("rows"),
+                "positives": window.get("positives"),
+                "when": latest.get("created_at"),
+            }
+    return {"available": False}

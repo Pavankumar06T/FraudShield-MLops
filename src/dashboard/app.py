@@ -80,6 +80,7 @@ champion = data.champion()
 if not champion.get("available"):
     st.error(f"No champion resolved: {champion.get('reason')}")
 else:
+    shadow = data.shadow_evidence(champion["version"])
     metric_row(
         [
             (
@@ -87,8 +88,19 @@ else:
                 f"v{champion['version']}",
                 f"stage {champion['stage']}, promoted {champion['created']}",
             ),
-            ("PR-AUC", fmt(champion["pr_auc"]), "on the run's own evaluation slice"),
-            ("ROC-AUC", fmt(champion["roc_auc"]), None),
+            (
+                "PR-AUC on unseen rows",
+                fmt(shadow.get("pr_auc")) if shadow.get("available") else "not tested",
+                "Shadow A/B, on live rows the model had never been trained on. "
+                "This is what it does in production.",
+            ),
+            (
+                "PR-AUC on its own eval slice",
+                fmt(champion["pr_auc"]),
+                "Recorded by the training run, on the tail of its own training "
+                "window. A different window from the shadow figure -- the two "
+                "are not comparable and routinely disagree.",
+            ),
             (
                 "Threshold",
                 fmt(champion["threshold"]),
@@ -102,6 +114,27 @@ else:
             ),
         ]
     )
+
+    if shadow.get("available"):
+        beat = (
+            f" beating v{shadow['beat_version']} at {fmt(shadow['beat_pr_auc'])}"
+            if shadow.get("beat_version")
+            else ""
+        )
+        st.info(
+            f"**The two PR-AUC figures above measure different windows and are "
+            f"not in conflict.** {fmt(shadow['pr_auc'])} is from the shadow test "
+            f"on {int(shadow['rows']):,} genuinely unseen rows"
+            f"{beat} — a margin of {fmt(shadow['delta'], '+.4f')} at "
+            f"{fmt(shadow['margin_ses'], '.2f')} standard errors. "
+            f"{fmt(champion['pr_auc'])} is what the training run recorded on the "
+            f"tail of its own window. Source: `{shadow['source']}`."
+        )
+    else:
+        st.warning(
+            "This model has no shadow-test result. The PR-AUC shown is its own "
+            "evaluation slice, which is not evidence of production performance."
+        )
     left, right = st.columns([2, 3])
     with left:
         st.markdown(

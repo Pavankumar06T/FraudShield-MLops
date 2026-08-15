@@ -63,10 +63,22 @@ This also removes a limitation that is easy to miss: SQLite tolerates one
 writer, so two runners retraining concurrently would collide. The workflow's
 `concurrency` group prevents that today, but that is a lock, not a fix.
 
-**3. Alerts in Postgres, not SQLite.** `src/drift/store.py` avoids
-SQLite-only constructs and stores ISO-8601 UTC text precisely so the schema
-survives this move; the queries are ordinary SQL. It is a driver swap and a
-connection string.
+**3. Alerts in Postgres, not SQLite.** This is real work, not a connection
+string — an earlier version of this note claimed otherwise and was wrong.
+Audited, `src/drift/store.py` and its callers use:
+
+| construct | count | Postgres needs |
+|---|---|---|
+| `INTEGER PRIMARY KEY AUTOINCREMENT` | 4 | `GENERATED ... AS IDENTITY` or `SERIAL` |
+| `PRAGMA journal_mode` / `PRAGMA table_info` | 2 | dropped; `information_schema.columns` for the migration |
+| `executescript` | 3 | split into separate statements |
+| `cursor.lastrowid` | 1 | `INSERT ... RETURNING id` |
+| `?` placeholders | throughout | `%s` |
+| `sqlite3.Row` | 1 | `RealDictCursor` |
+
+The timestamps being ISO-8601 UTC text does help, and the queries themselves
+are ordinary SQL. But the schema DDL, the migration mechanism, the insert
+path and every parameter marker change. Budget a day, not an afternoon.
 
 With those three, `runs-on:` becomes `ubuntu-latest` and nothing else in the
 workflow changes.

@@ -52,6 +52,13 @@ pytest>=8.0
 # Redpanda implements.
 confluent-kafka>=2.3
 
+# --- Dashboard ---
+# Streamlit rather than Prometheus + Grafana: 2 physical cores and 8 GB
+# already running Redpanda, MLflow and the model, with n_jobs pinned to
+# both cores. A scraper, a TSDB and a renderer would contend for exactly
+# the resources the pipeline needs. See src/dashboard/app.py.
+streamlit>=1.30
+
 # --- Serving ---
 fastapi>=0.110
 uvicorn[standard]>=0.27

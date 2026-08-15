@@ -36,14 +36,27 @@ from pathlib import Path
 import numpy as np
 import xgboost as xgb
 
+from src.common.config import REPORTS_DIR
 from src.features.build_features import ENCODERS_PATH, FeatureEncoders
 from src.serving.encoding import RowEncoder
 from src.training import tracking
 from src.training.train import DEFAULT_THRESHOLD, METRICS_PATH
 
-#: Registry alias to serve. An alias rather than a stage because MLflow 3
-#: deprecates stages; @staging is what survives their removal.
-MODEL_ALIAS: str = "staging"
+#: The model that decides. Serving and streaming both resolve this.
+CHAMPION_ALIAS: str = "champion"
+
+#: The candidate. Scored in parallel and never allowed to decide anything.
+CHALLENGER_ALIAS: str = "challenger"
+
+#: Tried in order when resolving the champion. ``staging`` is here because
+#: the registry carried only that alias before champion/challenger existed;
+#: a deployment mid-upgrade must not lose its model over a rename.
+CHAMPION_FALLBACKS: tuple[str, ...] = (CHAMPION_ALIAS, "staging")
+
+#: Aliases rather than stages because MLflow 3 deprecates stages and will
+#: remove them. Stages are still set alongside, for anyone reading the
+#: registry UI.
+MODEL_ALIAS: str = CHAMPION_ALIAS
 
 #: How many contributing factors to return per decision.
 DEFAULT_TOP_FACTORS: int = 6
@@ -86,16 +99,32 @@ class Prediction:
     unseen_categories: list[str] = field(default_factory=list)
 
 
-def load_threshold() -> tuple[float, str]:
-    """Promoted operating point, or 0.5 with an explicit note if absent."""
-    if METRICS_PATH.exists():
+#: Where each role's swept operating point is recorded. A challenger fitted
+#: on a different window has its own best-F1 point, and judging it at the
+#: champion's threshold would measure the threshold rather than the model.
+THRESHOLD_SOURCES: dict[str, Path] = {
+    CHAMPION_ALIAS: METRICS_PATH,
+    "staging": METRICS_PATH,
+    CHALLENGER_ALIAS: REPORTS_DIR / "retrain_metrics.json",
+}
+
+
+def load_threshold(alias: str = CHAMPION_ALIAS) -> tuple[float, str]:
+    """The swept operating point for a role, or 0.5 with an explicit note.
+
+    Not 0.5 by preference: under ``scale_pos_weight`` the probabilities are
+    deliberately uncalibrated, so 0.5 is an artifact of the class ratio
+    rather than a decision anyone made.
+    """
+    path = THRESHOLD_SOURCES.get(alias, METRICS_PATH)
+    if path.exists():
         try:
-            record = json.loads(METRICS_PATH.read_text(encoding="utf-8"))
+            record = json.loads(path.read_text(encoding="utf-8"))
             block = record["models"]["xgboost"]["val"]["at_best_f1_threshold"]
-            return float(block["threshold"]), f"best-F1 from {METRICS_PATH.name}"
+            return float(block["threshold"]), f"best-F1 from {path.name}"
         except (KeyError, ValueError, TypeError):
             pass
-    return DEFAULT_THRESHOLD, "default 0.5 -- metrics file missing or unreadable"
+    return DEFAULT_THRESHOLD, f"default 0.5 -- {path.name} missing or unreadable"
 
 
 def _load_encoders_for_run(mlflow, run_id: str | None) -> tuple[FeatureEncoders, str]:
@@ -117,8 +146,23 @@ def _load_encoders_for_run(mlflow, run_id: str | None) -> tuple[FeatureEncoders,
     return FeatureEncoders.load(ENCODERS_PATH), f"local {ENCODERS_PATH.name} (FALLBACK)"
 
 
+def resolve_alias(client, name: str, aliases: tuple[str, ...]):
+    """First alias in ``aliases`` that resolves, or None."""
+    for alias in aliases:
+        try:
+            return client.get_model_version_by_alias(name, alias), alias
+        except Exception:
+            continue
+    return None, None
+
+
 def load_bundle(model_name: str | None = None, alias: str = MODEL_ALIAS) -> ModelBundle:
-    """Resolve the promoted model and its encoders from the registry."""
+    """Resolve a registered model and its encoders.
+
+    ``alias`` may name a single alias or fall through ``CHAMPION_FALLBACKS``
+    when it is the champion, so a registry that predates the champion alias
+    still serves.
+    """
     name = model_name or tracking.REGISTERED_MODEL_NAME
     mlflow = tracking.mlflow_module()
     if mlflow is None:
@@ -132,16 +176,21 @@ def load_bundle(model_name: str | None = None, alias: str = MODEL_ALIAS) -> Mode
     from mlflow import MlflowClient
 
     client = MlflowClient()
-    version = client.get_model_version_by_alias(name, alias)
+    candidates = CHAMPION_FALLBACKS if alias == CHAMPION_ALIAS else (alias,)
+    version, alias = resolve_alias(client, name, candidates)
+    if version is None:
+        raise RuntimeError(
+            f"No version of {name!r} carries any of the aliases {candidates}."
+        )
 
-    model = mlflow.xgboost.load_model(f"models:/{name}@{alias}")
+    model = mlflow.xgboost.load_model(f"models:/{name}/{version.version}")
     booster = model.get_booster() if hasattr(model, "get_booster") else model
 
     best = getattr(model, "best_iteration", None)
     n_trees = int(best) + 1 if best is not None else booster.num_boosted_rounds()
 
     encoders, encoder_source = _load_encoders_for_run(mlflow, version.run_id)
-    threshold, threshold_source = load_threshold()
+    threshold, threshold_source = load_threshold(alias)
 
     bundle = ModelBundle(
         booster=booster,
@@ -210,3 +259,17 @@ def predict_one(
         top_factors=factors,
         unseen_categories=list(encoded.unseen),
     )
+
+
+def try_load_bundle(alias: str, model_name: str | None = None) -> ModelBundle | None:
+    """Load a bundle if the alias exists, else None.
+
+    Used for the challenger: a registry with no candidate in it is the
+    normal state, not an error, and shadow scoring must simply not happen
+    rather than fail the consumer.
+    """
+    try:
+        return load_bundle(model_name, alias)
+    except Exception as exc:
+        print(f"  no {alias} model ({type(exc).__name__}); scoring champion only")
+        return None

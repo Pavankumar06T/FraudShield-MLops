@@ -121,6 +121,12 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("drift_alerts", "resolved_at TEXT"),
     ("drift_alerts", "resolved_by_run_id TEXT"),
     ("drift_alerts", "resolved_model_version TEXT"),
+    # Shadow scoring. stream_predictions predates the challenger columns, and
+    # CREATE TABLE IF NOT EXISTS leaves an existing table untouched.
+    ("stream_predictions", "challenger_version TEXT"),
+    ("stream_predictions", "challenger_probability REAL"),
+    ("stream_predictions", "challenger_decision TEXT"),
+    ("stream_predictions", "challenger_threshold REAL"),
 )
 
 

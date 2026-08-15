@@ -40,7 +40,14 @@ from collections import Counter
 from pathlib import Path
 
 from src.drift import store
-from src.serving.predictor import ModelBundle, load_bundle, predict_one
+from src.serving.predictor import (
+    CHALLENGER_ALIAS,
+    CHAMPION_ALIAS,
+    ModelBundle,
+    load_bundle,
+    predict_one,
+    try_load_bundle,
+)
 from src.streaming.config import CONSUMER_GROUP, RAW_TOPIC, consumer_config
 
 #: The label. Present in the message for scoring-quality monitoring, never
@@ -52,6 +59,15 @@ LABEL_FIELD: str = "isFraud"
 BATCH_SIZE: int = 200
 
 PROGRESS_EVERY: int = 2_000
+
+#: Positions in the audit row tuple. Named because they are read back by
+#: index in the consume loop, and an off-by-two there reports every row as a
+#: champion/challenger disagreement without anything looking wrong.
+DECISION_IX: int = 4
+CHALLENGER_VERSION_IX: int = 10
+CHALLENGER_DECISION_IX: int = 12
+CHALLENGER_THRESHOLD_IX: int = 13
+TRUE_LABEL_IX: int = 14
 
 _STOPPING = False
 
@@ -75,6 +91,15 @@ CREATE TABLE IF NOT EXISTS stream_predictions (
     n_trees             INTEGER NOT NULL,
     unseen_categories   TEXT,
     top_factors         TEXT,
+
+    -- Shadow columns. The challenger scores every row in parallel and its
+    -- output is recorded, never acted on: `decision` above is the champion's
+    -- and nothing here can reach it.
+    challenger_version      TEXT,
+    challenger_probability  REAL,
+    challenger_decision     TEXT,
+    challenger_threshold    REAL,
+
     -- Monitoring only. Never an input; see the module docstring.
     true_label          INTEGER,
     latency_ms          REAL
@@ -100,38 +125,72 @@ def write_batch(rows: list[tuple], path: Path = store.DEFAULT_DB_PATH) -> int:
             INSERT INTO stream_predictions (
                 scored_at, transaction_id, transaction_dt, fraud_probability,
                 decision, threshold, model_version, n_trees,
-                unseen_categories, top_factors, true_label, latency_ms
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                unseen_categories, top_factors,
+                challenger_version, challenger_probability,
+                challenger_decision, challenger_threshold,
+                true_label, latency_ms
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             rows,
         )
     return len(rows)
 
 
-def score_message(bundle: ModelBundle, message: dict) -> tuple[tuple, list[str]]:
+def score_message(
+    bundle: ModelBundle,
+    message: dict,
+    challenger: ModelBundle | None = None,
+) -> tuple[tuple, list[str]]:
     """Score one transaction and shape it for the audit table.
 
     The label is pulled out for storage *before* scoring, purely for
     readability -- pulling it out is not what protects the model. The
     encoder only ever reads ``bundle.feature_names``, which does not contain
     it, so passing the whole message in would be equally safe.
+
+    When a challenger is supplied it scores the same transaction through the
+    same ``predict_one``, with its own bundle and its own swept threshold.
+    Its output is recorded and nothing else: the returned decision is
+    computed before the challenger runs and is never revisited. A challenger
+    that returned 1.0 for every row would change nothing but the shadow
+    columns.
     """
     label = message.get(LABEL_FIELD)
     started = time.perf_counter()
     prediction = predict_one(bundle, message)
     latency = (time.perf_counter() - started) * 1000
 
+    # Computed here, from the champion alone, and used verbatim below.
+    decision = prediction.decision
+
+    shadow_version = shadow_probability = shadow_decision = shadow_threshold = None
+    if challenger is not None:
+        try:
+            shadow = predict_one(challenger, message, top_factors=0)
+            shadow_version = challenger.model_version
+            shadow_probability = round(shadow.fraud_probability, 6)
+            shadow_decision = shadow.decision
+            shadow_threshold = round(challenger.threshold, 6)
+        except Exception:
+            # A failing challenger must not cost a real decision. The row is
+            # still recorded, with the shadow columns left null.
+            pass
+
     row = (
         store.utc_now(),
         str(message.get("TransactionID")) if message.get("TransactionID") is not None else None,
         float(message["TransactionDT"]) if message.get("TransactionDT") is not None else None,
         round(prediction.fraud_probability, 6),
-        prediction.decision,
+        decision,
         round(prediction.threshold, 6),
         prediction.model_version,
         prediction.n_trees,
         json.dumps(prediction.unseen_categories),
         json.dumps(prediction.top_factors),
+        shadow_version,
+        shadow_probability,
+        shadow_decision,
+        shadow_threshold,
         int(label) if label is not None else None,
         round(latency, 3),
     )
@@ -150,7 +209,14 @@ def consume(
     from confluent_kafka import Consumer, KafkaError
 
     ensure_schema(db_path)
-    bundle = load_bundle()
+    bundle = load_bundle(alias=CHAMPION_ALIAS)
+    challenger = try_load_bundle(CHALLENGER_ALIAS)
+    if challenger is not None:
+        print(
+            f"  shadow scoring against challenger v{challenger.model_version} "
+            f"at threshold {challenger.threshold:.4f} -- its output is recorded, "
+            "never acted on"
+        )
 
     extra = {"auto.offset.reset": "earliest"} if from_beginning else {}
     consumer = Consumer(consumer_config(group, extra))
@@ -159,7 +225,8 @@ def consume(
 
     pending: list[tuple] = []
     unseen_counter: Counter = Counter()
-    stats = {"scored": 0, "blocked": 0, "allowed": 0, "unseen_rows": 0, "errors": 0}
+    stats = {"scored": 0, "blocked": 0, "allowed": 0, "unseen_rows": 0,
+             "errors": 0, "shadow_scored": 0, "disagreements": 0}
     started = time.perf_counter()
     last_message = time.perf_counter()
 
@@ -186,10 +253,17 @@ def consume(
                 stats["errors"] += 1
                 continue
 
-            row, unseen = score_message(bundle, payload)
+            row, unseen = score_message(bundle, payload, challenger)
             pending.append(row)
             stats["scored"] += 1
             stats["blocked" if row[4] == "BLOCK" else "allowed"] += 1
+            # Index 12 is challenger_decision, 4 is the champion's. Comparing
+            # against index 10 (challenger_version) would report every row as
+            # a disagreement, which is how this was first written.
+            if row[CHALLENGER_VERSION_IX] is not None:
+                stats["shadow_scored"] += 1
+                if row[CHALLENGER_DECISION_IX] != row[DECISION_IX]:
+                    stats["disagreements"] += 1
             if unseen:
                 stats["unseen_rows"] += 1
                 for feature in unseen:
@@ -238,7 +312,10 @@ def format_stats(stats: dict) -> str:
         f"  blocked    {stats['blocked']:,} ({100 * stats['blocked'] / scored:.2f}%)\n"
         f"  allowed    {stats['allowed']:,}\n"
         f"  unseen     {stats['unseen_rows']:,} rows carried an unseen category\n"
-        f"  errors     {stats['errors']:,}"
+        f"  errors     {stats['errors']:,}\n"
+        f"  shadow     {stats['shadow_scored']:,} also scored by the challenger, "
+        f"{stats['disagreements']:,} disagreements ("
+        f"{100 * stats['disagreements'] / max(stats['shadow_scored'], 1):.2f}%)"
     )
 
 

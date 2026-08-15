@@ -31,7 +31,13 @@ from src.features.build_features import FeatureEncoders, read_split
 from src.serving.encoding import RowEncoder
 from src.serving.predictor import predict_one
 from src.streaming.config import consumer_config, producer_config
-from src.streaming.consumer import LABEL_FIELD, ensure_schema, score_message, write_batch
+from src.streaming.consumer import (
+    LABEL_FIELD,
+    TRUE_LABEL_IX,
+    ensure_schema,
+    score_message,
+    write_batch,
+)
 from src.streaming.producer import load_ordered, to_message
 from src.training.train import XGB_MODEL_PATH
 
@@ -135,7 +141,9 @@ def test_label_is_still_recorded_for_monitoring(rows, bundle):
     row_with_label = rows[rows[LABEL_FIELD].notna()].iloc[0]
     payload = to_message(row_with_label)
     record, _ = score_message(bundle, payload)
-    assert record[10] == int(row_with_label[LABEL_FIELD])
+    # By position, via the named constant: adding the four shadow columns
+    # moved the label from index 10 to 14, and a literal here broke silently.
+    assert record[TRUE_LABEL_IX] == int(row_with_label[LABEL_FIELD])
 
 
 # --------------------------------------------------------------------------

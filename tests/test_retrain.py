@@ -41,13 +41,21 @@ def db(tmp_path):
     return tmp_path / "drift.db"
 
 
-def insert_alert(db, *, retrain=True, value_psi=1.78, miss_psi=0.55, top=None):
+def insert_alert(db, *, retrain=True, value_psi=1.78, miss_psi=0.55, top=None,
+                 value_list=None, miss_list=None):
     top = top if top is not None else [
         {"feature": "id_31", "psi": 1.7835, "type": "value"},
         {"feature": "id_13", "psi": 0.5086, "type": "value"},
         {"feature": "M9", "psi": 0.5490, "type": "missingness"},
     ]
     return store.DriftAlert(
+        value_drift_feature_list=(
+            value_list if value_list is not None
+            else ["id_31", "id_13", "D11", "id_30", "V160", "V145", "V144", "V159"]
+        ),
+        missingness_feature_list=(
+            miss_list if miss_list is not None else ["M9", "M8", "M7", "V3"]
+        ),
         window_label="last 30 days", window_rows=85_431, reference_rows=319_927,
         overall_psi=max(value_psi, miss_psi), overall_psi_feature="id_31",
         value_drift_psi=value_psi, value_drift_features=10,
@@ -172,11 +180,37 @@ def test_only_value_drift_features_are_named_as_the_cause(db):
     params = trigger_params(store.latest_retrain_trigger(db))
     named = params["trigger.drifting_features"].split(",")
     assert "id_31" in named and "id_13" in named
-    assert "M9" not in named
+    assert not {"M9", "M8", "M7", "V3"} & set(named)
 
 
-def test_trigger_params_survive_an_alert_with_no_top_features(db):
-    insert_alert(db, top=[])
+def test_every_drifting_feature_is_named_not_just_the_highest_psi_ones(db):
+    """top_features is ranked by raw PSI, and the missingness cluster
+    outranks most of the value-drift cluster -- so deriving the cause from a
+    top-15 slice named 3 of 10 features and understated why the model
+    exists. The full classified list is stored and used instead."""
+    insert_alert(db)
+    alert = store.latest_retrain_trigger(db)
+    named = trigger_params(alert)["trigger.drifting_features"].split(",")
+
+    assert len(named) == 8
+    for feature in ("id_30", "V160", "V145", "V144", "V159"):
+        assert feature in named, f"{feature} drifted but is absent from the record"
+    # none of these appear in top_features, so a top-N derivation would miss them
+    top_named = {f["feature"] for f in json.loads(alert["top_features"])}
+    assert not {"id_30", "V160", "V145"} & top_named
+
+
+def test_cause_falls_back_to_top_features_for_a_pre_migration_alert(db):
+    """An alert written before the list column existed must still name what
+    it can rather than reporting nothing."""
+    insert_alert(db, value_list=[], miss_list=[])
+    params = trigger_params(store.latest_retrain_trigger(db))
+    named = params["trigger.drifting_features"].split(",")
+    assert "id_31" in named and "M9" not in named
+
+
+def test_trigger_params_survive_an_alert_with_no_features_at_all(db):
+    insert_alert(db, top=[], value_list=[], miss_list=[])
     params = trigger_params(store.latest_retrain_trigger(db))
     assert params["trigger.drifting_features"] == "(none recorded)"
 

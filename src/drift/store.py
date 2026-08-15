@@ -67,6 +67,16 @@ CREATE TABLE IF NOT EXISTS drift_alerts (
     verdict                 TEXT    NOT NULL,
 
     top_features            TEXT    NOT NULL,  -- JSON
+
+    -- The two classified feature lists, stored in full rather than derived
+    -- from top_features. top_features is ranked by raw PSI, and in this
+    -- dataset the missingness cluster outranks most of the value-drift
+    -- cluster -- so a top-15 slice names only 3 of the 10 features that
+    -- actually triggered the retrain, and the run record would understate
+    -- its own cause.
+    value_drift_feature_list    TEXT,          -- JSON
+    missingness_feature_list    TEXT,          -- JSON
+
     unseen_categories       TEXT,              -- JSON
     evidently_report_path   TEXT,
 
@@ -106,6 +116,8 @@ def utc_now() -> str:
 #: an older table untouched -- so a store written before resolution tracking
 #: existed would keep working and then fail on the first UPDATE.
 MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("drift_alerts", "value_drift_feature_list TEXT"),
+    ("drift_alerts", "missingness_feature_list TEXT"),
     ("drift_alerts", "resolved_at TEXT"),
     ("drift_alerts", "resolved_by_run_id TEXT"),
     ("drift_alerts", "resolved_model_version TEXT"),
@@ -161,6 +173,8 @@ class DriftAlert:
     investigate_pipeline: bool
     verdict: str
     top_features: list[dict]
+    value_drift_feature_list: list[str] = field(default_factory=list)
+    missingness_feature_list: list[str] = field(default_factory=list)
     window_start_dt: float | None = None
     window_end_dt: float | None = None
     unseen_categories: list[dict] = field(default_factory=list)
@@ -178,8 +192,10 @@ class DriftAlert:
                     missingness_psi, missingness_features,
                     n_major, n_moderate, n_stable, n_unmeasurable,
                     threshold, retrain_triggered, investigate_pipeline, verdict,
-                    top_features, unseen_categories, evidently_report_path
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    top_features, value_drift_feature_list,
+                    missingness_feature_list, unseen_categories,
+                    evidently_report_path
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     self.created_at, self.window_label, self.window_start_dt,
@@ -191,6 +207,8 @@ class DriftAlert:
                     self.threshold, int(self.retrain_triggered),
                     int(self.investigate_pipeline), self.verdict,
                     json.dumps(self.top_features),
+                    json.dumps(self.value_drift_feature_list),
+                    json.dumps(self.missingness_feature_list),
                     json.dumps(self.unseen_categories),
                     self.evidently_report_path,
                 ),

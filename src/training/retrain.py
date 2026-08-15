@@ -211,8 +211,14 @@ def trigger_params(alert: dict) -> dict[str, object]:
     Recorded verbatim from the alert rather than recomputed: the point is
     that the model and the measurement agree about why it exists.
     """
-    top = json.loads(alert.get("top_features") or "[]")
-    value_features = [f["feature"] for f in top if f.get("type") == "value"]
+    # Prefer the full classified list. Falling back to top_features loses
+    # most of the cause: that list is ranked by raw PSI, and the
+    # missingness cluster outranks most of the value-drift cluster, so a
+    # top-15 slice named only 3 of the 10 features that fired the retrain.
+    value_features = json.loads(alert.get("value_drift_feature_list") or "[]")
+    if not value_features:
+        top = json.loads(alert.get("top_features") or "[]")
+        value_features = [f["feature"] for f in top if f.get("type") == "value"]
     return {
         "trigger.alert_id": alert["id"],
         "trigger.created_at": alert["created_at"],

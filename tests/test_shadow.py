@@ -22,6 +22,8 @@ import pytest
 from src.drift import store
 from src.serving.compare import (
     DEFAULT_MARGIN_SES,
+    MAX_LEAKAGE_OVERLAP,
+    format_comparison,
     MIN_POSITIVES,
     MIN_ROWS,
     Comparison,
@@ -330,3 +332,83 @@ def test_promotion_is_refused_when_the_verdict_says_no(tmp_path):
     result = make_comparison(delta=0.0023, se=0.0080)
     with pytest.raises(RuntimeError, match="refusing to promote"):
         promote(result, tmp_path / "drift.db")
+
+
+# --------------------------------------------------------------------------
+# Leakage: the judged rows must be unseen by the challenger
+# --------------------------------------------------------------------------
+
+
+def leaky(delta=0.2492, se=0.0124, overlap=1.0,
+          scored=(10_569_737.0, 11_106_772.0),
+          trained=(5_443_151.0, 15_811_131.0)):
+    result = make_comparison(delta=delta, se=se)
+    result.leakage_overlap = overlap
+    result.scored_dt_range = scored
+    result.trained_dt_range = trained
+    return result
+
+
+def test_v3_actual_ranges_refuse_at_full_overlap():
+    """The real numbers from the run that was wrongly promoted.
+
+    v3 trained on TransactionDT 5,443,151..15,811,131 and was judged on
+    10,569,737..11,106,772 -- entirely inside it. It scored +0.2492 at 20 SE
+    and promoted. The margin rule cannot catch this: a larger overlap makes
+    the apparent win more decisive, not less.
+    """
+    result = leaky()
+    assert result.leakage_overlap == pytest.approx(1.0)
+    assert result.leaked is True
+    assert result.trustworthy is False
+    assert result.promote is False, "a 20 SE margin must not promote a leaked comparison"
+    assert result.verdict.startswith("NO VERDICT")
+    assert "overlap" in result.verdict
+
+
+def test_the_refusal_names_both_ranges_and_the_percentage():
+    text = format_comparison(leaky())
+    assert "100.0%" in text
+    assert "10,569,737" in text and "11,106,772" in text
+    assert "5,443,151" in text and "15,811,131" in text
+    assert "No verdict is issued." in text
+
+
+def test_a_clean_comparison_is_unaffected():
+    """The guard must not refuse an honest test."""
+    result = leaky(overlap=0.0, trained=(0.0, 9_000_000.0))
+    assert result.leaked is False
+    assert result.trustworthy is True
+    assert result.promote is True
+
+
+@pytest.mark.parametrize("overlap,expected_leak", [
+    (0.000, False),
+    (0.005, False),   # a boundary row should not void an honest test
+    (0.011, True),
+    (0.500, True),
+    (1.000, True),
+])
+def test_the_tolerance_is_small_but_not_zero(overlap, expected_leak):
+    assert leaky(overlap=overlap).leaked is expected_leak
+    assert MAX_LEAKAGE_OVERLAP == pytest.approx(0.01)
+
+
+def test_overlap_fraction_is_measured_against_the_judged_range():
+    from src.serving.compare import overlap_fraction
+
+    # fully inside
+    assert overlap_fraction((10.0, 20.0), (0.0, 100.0)) == pytest.approx(1.0)
+    # fully outside
+    assert overlap_fraction((10.0, 20.0), (30.0, 40.0)) == pytest.approx(0.0)
+    # half covered
+    assert overlap_fraction((10.0, 20.0), (15.0, 40.0)) == pytest.approx(0.5)
+    # training window strictly before the judged rows -- the clean case
+    assert overlap_fraction((10_569_737.0, 11_106_772.0), (86_400.0, 10_569_554.0)) == 0.0
+
+
+def test_leakage_outranks_every_other_verdict():
+    """It is checked first because no other conclusion is meaningful once
+    the rows are compromised."""
+    result = leaky(delta=-0.5, se=0.001)   # decisively worse, and leaked
+    assert result.verdict.startswith("NO VERDICT")

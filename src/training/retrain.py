@@ -154,6 +154,7 @@ def load_recent_window(
     window_days: float = DEFAULT_WINDOW_DAYS,
     eval_fraction: float = EVAL_FRACTION,
     holdout_fraction: float = ES_HOLDOUT_FRACTION,
+    end_dt: float | None = None,
 ) -> RetrainWindow:
     """Everything labelled within the last ``window_days``, split in time.
 
@@ -161,6 +162,12 @@ def load_recent_window(
     both are history by the time a retrain fires; the fixed Phase 0
     boundary was a modelling decision for the baseline, not a property of
     the data.
+
+    ``end_dt`` bounds the window on the right, so it can stop short of the
+    newest data. That is what makes an honest shadow test possible on a
+    finite historical dataset: the rows the challenger will later be judged
+    on have to sit outside everything it was fitted on, and without this the
+    window always runs to the end and swallows them.
 
     The split is three-way and strictly ordered: earliest rows fit, the next
     slice stops, the most recent slice evaluates. Evaluating on the *newest*
@@ -180,9 +187,15 @@ def load_recent_window(
     everything = pd.concat(frames, ignore_index=True)
     everything = everything.sort_values(TIME_COLUMN, kind="mergesort").reset_index(drop=True)
 
+    if end_dt is not None:
+        everything = everything[everything[TIME_COLUMN] < float(end_dt)].reset_index(drop=True)
+        if everything.empty:
+            raise ValueError(f"No rows before TransactionDT {float(end_dt):,.0f}.")
+
     times = everything[TIME_COLUMN]
-    span = float(times.max() - times.min())
-    cutoff = float(times.max()) - min(window_days * SECONDS_PER_DAY, span)
+    upper = float(times.max())
+    span = float(upper - times.min())
+    cutoff = upper - min(window_days * SECONDS_PER_DAY, span)
     window = everything[times >= cutoff].reset_index(drop=True)
 
     if len(window) < 1000:
@@ -292,6 +305,7 @@ def register_challenger(run_id: str, alert_id: int, metrics: dict) -> dict | Non
 
 def retrain(
     window_days: float = DEFAULT_WINDOW_DAYS,
+    end_dt: float | None = None,
     alert: dict | None = None,
     db_path: Path = store.DEFAULT_DB_PATH,
     register: bool = True,
@@ -316,7 +330,7 @@ def retrain(
         f"{alert['overall_psi']:.4f}"
     )
 
-    window = load_recent_window(window_days)
+    window = load_recent_window(window_days, end_dt=end_dt)
     print(
         f"\nwindow  {window.label}  {window.rows:,} rows from "
         f"{', '.join(window.sources)}\n"
@@ -398,6 +412,7 @@ def retrain(
         **trigger_params(alert),
         "retrain.window_label": window.label,
         "retrain.window_days": window_days,
+        "retrain.window_end_bound": end_dt,
         "retrain.window_start_dt": window.start_dt,
         "retrain.window_end_dt": window.end_dt,
         "retrain.sources": ",".join(window.sources),
@@ -465,6 +480,9 @@ def retrain(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Drift-triggered retraining.")
     parser.add_argument("--window-days", type=float, default=DEFAULT_WINDOW_DAYS)
+    parser.add_argument("--end-dt", type=float, default=None, metavar="DT",
+                        help="bound the window on the right; rows at or after this "
+                             "TransactionDT are excluded from training entirely")
     parser.add_argument("--alert-id", type=int, default=None,
                         help="answer a specific alert instead of the newest open one")
     parser.add_argument("--check-only", action="store_true",
@@ -499,7 +517,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        retrain(window_days=args.window_days, alert=alert, db_path=args.db,
+        retrain(window_days=args.window_days, end_dt=args.end_dt,
+                alert=alert, db_path=args.db,
                 register=not args.no_register)
     except ThreadPinningError as exc:
         print(f"REFUSING TO REGISTER: {exc}")

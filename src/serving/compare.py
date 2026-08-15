@@ -61,6 +61,12 @@ MIN_ROWS: int = 5_000
 #: the metric lives entirely on the minority class.
 MIN_POSITIVES: int = 100
 
+#: Fraction of the judged rows that may fall inside the challenger's
+#: training window before the comparison is refused outright. Not zero: a
+#: boundary row or a rounding difference in the recorded window should not
+#: void an otherwise clean test. Anything above this is memory, not skill.
+MAX_LEAKAGE_OVERLAP: float = 0.01
+
 #: Margin required, in standard errors. 1.0 is the Phase 2 standard: a
 #: difference smaller than one SE is noise. Note this is roughly 84%
 #: one-sided confidence, not 95% -- raise it to 1.65 or 2.0 for a stricter
@@ -124,22 +130,43 @@ class Comparison:
     required_ses: float
     sufficient_data: bool
     reason: str
+    leakage_overlap: float = 0.0
+    scored_dt_range: tuple[float, float] | None = None
+    trained_dt_range: tuple[float, float] | None = None
     trigger_alert_id: int | None = None
     window_start: str | None = None
     window_end: str | None = None
     bootstrap_ci: tuple[float, float] = field(default=(0.0, 0.0))
 
     @property
+    def leaked(self) -> bool:
+        """Were the judged rows inside the challenger's training window?
+
+        Any material overlap invalidates the comparison: the challenger is
+        being asked to recall rows it was fitted on while the champion
+        predicts them. That is a contest between memory and prediction, and
+        no margin rule can rescue it -- the larger the overlap, the more
+        decisively it will report a win.
+        """
+        return self.leakage_overlap > MAX_LEAKAGE_OVERLAP
+
+    @property
+    def trustworthy(self) -> bool:
+        return self.sufficient_data and not self.leaked
+
+    @property
     def promote(self) -> bool:
         """Only a margin beyond noise, on enough data, promotes."""
         return bool(
-            self.sufficient_data
+            self.trustworthy
             and self.pr_auc_delta > 0
             and self.margin_in_ses >= self.required_ses
         )
 
     @property
     def verdict(self) -> str:
+        if self.leaked:
+            return "NO VERDICT -- evaluation rows overlap the challenger's training window"
         if not self.sufficient_data:
             return "NO PROMOTION -- insufficient data"
         if self.promote:
@@ -218,25 +245,88 @@ def paired_bootstrap(
     )
 
 
+def challenger_training_window(
+    challenger_version: str, model_name: str | None = None
+) -> tuple[float, float] | None:
+    """The TransactionDT range the challenger was fitted on, from its run.
+
+    Read from the MLflow run parameters the retrain logged, rather than
+    recomputed -- the run record is what ties a model to the data behind it,
+    and recomputing would let the two disagree.
+    """
+    mlflow = tracking.mlflow_module()
+    if mlflow is None:
+        return None
+    try:
+        mlflow.set_tracking_uri(tracking.tracking_uri())
+        from mlflow import MlflowClient
+
+        client = MlflowClient()
+        name = model_name or tracking.REGISTERED_MODEL_NAME
+        version = client.get_model_version(name, challenger_version)
+        params = client.get_run(version.run_id).data.params
+        return (
+            float(params["retrain.window_start_dt"]),
+            float(params["retrain.window_end_dt"]),
+        )
+    except Exception:
+        return None
+
+
+def overlap_fraction(
+    scored: tuple[float, float], trained: tuple[float, float]
+) -> float:
+    """Fraction of the scored range that sits inside the trained range."""
+    span = scored[1] - scored[0]
+    if span <= 0:
+        return 1.0 if trained[0] <= scored[0] <= trained[1] else 0.0
+    covered = min(scored[1], trained[1]) - max(scored[0], trained[0])
+    return max(0.0, covered) / span
+
+
 def load_paired_rows(
-    limit: int | None = None, db_path: Path = store.DEFAULT_DB_PATH
+    limit: int | None = None,
+    db_path: Path = store.DEFAULT_DB_PATH,
+    challenger_version: str | None = None,
+    champion_version: str | None = None,
 ) -> list[dict]:
     """Audit rows where both models scored and the label is known.
 
     The join is implicit: a row carries both predictions because both models
     scored that same transaction in the same pass, so there is nothing to
     align and no chance of comparing different rows.
+
+    Pinned to **one** champion/challenger pair. Once a second challenger has
+    been registered the table holds rows from both, and an unfiltered query
+    would average two different models together while reporting whichever
+    version happened to be on the newest row -- a comparison of a model
+    against itself-plus-its-predecessor, which would look entirely normal.
+    Defaults to the most recently scored pair.
     """
-    query = (
-        "SELECT * FROM stream_predictions "
-        "WHERE challenger_probability IS NOT NULL AND true_label IS NOT NULL "
-        "ORDER BY id DESC"
-    )
-    if limit:
-        query += f" LIMIT {int(limit)}"
     with store.connect(db_path) as connection:
         try:
-            rows = connection.execute(query).fetchall()
+            if challenger_version is None or champion_version is None:
+                newest = connection.execute(
+                    "SELECT model_version, challenger_version FROM stream_predictions "
+                    "WHERE challenger_probability IS NOT NULL AND true_label IS NOT NULL "
+                    "ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if newest is None:
+                    return []
+                champion_version = champion_version or str(newest["model_version"])
+                challenger_version = challenger_version or str(newest["challenger_version"])
+
+            query = (
+                "SELECT * FROM stream_predictions "
+                "WHERE challenger_probability IS NOT NULL AND true_label IS NOT NULL "
+                "AND model_version = ? AND challenger_version = ? "
+                "ORDER BY id DESC"
+            )
+            if limit:
+                query += f" LIMIT {int(limit)}"
+            rows = connection.execute(
+                query, (champion_version, challenger_version)
+            ).fetchall()
         except Exception:
             return []
     return [dict(row) for row in rows]
@@ -245,13 +335,14 @@ def load_paired_rows(
 def compare(
     limit: int | None = None,
     resamples: int = DEFAULT_BOOTSTRAP,
+    challenger_version: str | None = None,
     min_rows: int = MIN_ROWS,
     min_positives: int = MIN_POSITIVES,
     required_ses: float = DEFAULT_MARGIN_SES,
     db_path: Path = store.DEFAULT_DB_PATH,
 ) -> Comparison:
     """Score both models on the shared rows and decide."""
-    rows = load_paired_rows(limit, db_path)
+    rows = load_paired_rows(limit, db_path, challenger_version=challenger_version)
     if not rows:
         raise RuntimeError(
             "No audit rows carry both a champion and a challenger prediction. "
@@ -295,8 +386,23 @@ def compare(
     )
     margin = abs(delta) / standard_error if standard_error and standard_error == standard_error else 0.0
 
+    scored_range = (
+        min(r["transaction_dt"] for r in rows if r["transaction_dt"] is not None),
+        max(r["transaction_dt"] for r in rows if r["transaction_dt"] is not None),
+    )
+    trained_range = challenger_training_window(challenger.version)
+    leakage = overlap_fraction(scored_range, trained_range) if trained_range else 0.0
+    if leakage > MAX_LEAKAGE_OVERLAP:
+        reason = (
+            f"{leakage * 100:.1f}% of the judged rows fall inside the "
+            "challenger's training window"
+        )
+
     alert = store.latest_retrain_trigger(db_path, include_resolved=True)
     return Comparison(
+        leakage_overlap=leakage,
+        scored_dt_range=scored_range,
+        trained_dt_range=trained_range,
         rows=len(rows),
         positives=positives,
         fraud_rate=fraud_rate,
@@ -354,7 +460,22 @@ def format_comparison(result: Comparison) -> str:
         f"  margin                 {result.margin_in_ses:.2f} SE  "
         f"(need {result.required_ses:.2f})",
     ]
-    if not result.sufficient_data:
+    if result.leaked:
+        scored = result.scored_dt_range or (0.0, 0.0)
+        trained = result.trained_dt_range or (0.0, 0.0)
+        lines += [
+            "",
+            f"  LEAKAGE: {result.leakage_overlap * 100:.1f}% of the judged rows sit "
+            "inside the challenger's",
+            "  own training window.",
+            f"    judged  TransactionDT {scored[0]:,.0f} .. {scored[1]:,.0f}",
+            f"    trained TransactionDT {trained[0]:,.0f} .. {trained[1]:,.0f}",
+            "",
+            "  The challenger is recalling rows it was fitted on while the champion",
+            "  predicts them. No margin rule can rescue that -- a larger overlap",
+            "  produces a more decisive apparent win. No verdict is issued.",
+        ]
+    elif not result.sufficient_data:
         lines.append(f"\n  Not a decision: {result.reason}.")
     elif result.promote:
         lines.append(
@@ -448,6 +569,10 @@ def as_dict(result: Comparison) -> dict:
             "end": result.window_end,
             "sufficient": result.sufficient_data,
             "reason": result.reason,
+            "leakage_overlap": result.leakage_overlap,
+            "leaked": result.leaked,
+            "scored_dt_range": list(result.scored_dt_range or ()),
+            "trained_dt_range": list(result.trained_dt_range or ()),
         },
         "champion": vars(result.champion),
         "challenger": vars(result.challenger),
@@ -465,6 +590,8 @@ def as_dict(result: Comparison) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Shadow A/B champion vs challenger.")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--challenger-version", default=None,
+                        help="pin the comparison to one challenger (default: newest)")
     parser.add_argument("--bootstrap", type=int, default=DEFAULT_BOOTSTRAP)
     parser.add_argument("--min-rows", type=int, default=MIN_ROWS)
     parser.add_argument("--min-positives", type=int, default=MIN_POSITIVES)
@@ -477,6 +604,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = compare(
             limit=args.limit, resamples=args.bootstrap, min_rows=args.min_rows,
+            challenger_version=args.challenger_version,
             min_positives=args.min_positives, required_ses=args.margin_ses,
             db_path=args.db,
         )

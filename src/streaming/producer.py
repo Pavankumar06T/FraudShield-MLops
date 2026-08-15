@@ -78,7 +78,11 @@ def to_message(row: pd.Series) -> dict:
     return message
 
 
-def load_ordered(limit: int | None = None, path: Path = STREAM_PARQUET) -> pd.DataFrame:
+def load_ordered(
+    limit: int | None = None,
+    path: Path = STREAM_PARQUET,
+    start_dt: float | None = None,
+) -> pd.DataFrame:
     """The stream split in TransactionDT order.
 
     Sorted explicitly rather than trusting the file's row order. The parquet
@@ -87,6 +91,14 @@ def load_ordered(limit: int | None = None, path: Path = STREAM_PARQUET) -> pd.Da
     """
     frame = pd.read_parquet(path)
     frame = frame.sort_values("TransactionDT", kind="mergesort").reset_index(drop=True)
+    if start_dt is not None:
+        # Replay a later slice than the file's beginning. Needed for an
+        # honest shadow test: the judged rows must post-date everything the
+        # challenger was trained on, and replaying from row zero forces the
+        # training window back before all the drift.
+        frame = frame[frame["TransactionDT"] >= float(start_dt)].reset_index(drop=True)
+        if frame.empty:
+            raise ValueError(f"No rows at or after TransactionDT {float(start_dt):,.0f}.")
     return frame.head(limit) if limit else frame
 
 
@@ -95,11 +107,12 @@ def publish(
     limit: int | None = None,
     topic: str = RAW_TOPIC,
     path: Path = STREAM_PARQUET,
+    start_dt: float | None = None,
 ) -> int:
     """Publish the ordered stream, paced at ``rate`` messages per second."""
     from confluent_kafka import Producer
 
-    frame = load_ordered(limit, path)
+    frame = load_ordered(limit, path, start_dt)
     span_days = (
         frame["TransactionDT"].max() - frame["TransactionDT"].min()
     ) / 86_400
@@ -177,12 +190,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rate", type=float, default=DEFAULT_RATE,
                         help="messages per second; 0 for unthrottled")
     parser.add_argument("--limit", type=int, default=None, metavar="N")
+    parser.add_argument("--start-dt", type=float, default=None, metavar="DT",
+                        help="replay only rows at or after this TransactionDT")
     parser.add_argument("--topic", default=RAW_TOPIC)
     args = parser.parse_args(argv)
 
     signal.signal(signal.SIGINT, _handle_signal)
     try:
-        publish(rate=args.rate, limit=args.limit, topic=args.topic)
+        publish(rate=args.rate, limit=args.limit, topic=args.topic,
+                start_dt=args.start_dt)
     except Exception as exc:
         print(f"producer failed: {type(exc).__name__}: {exc}")
         return 1

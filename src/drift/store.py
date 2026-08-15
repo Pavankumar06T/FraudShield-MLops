@@ -68,7 +68,14 @@ CREATE TABLE IF NOT EXISTS drift_alerts (
 
     top_features            TEXT    NOT NULL,  -- JSON
     unseen_categories       TEXT,              -- JSON
-    evidently_report_path   TEXT
+    evidently_report_path   TEXT,
+
+    -- Resolution. An alert stays open until a retrain consumes it, so the
+    -- scheduled workflow cannot retrain twice on the same drift, and the
+    -- run that answered an alert is recorded on the alert itself.
+    resolved_at             TEXT,
+    resolved_by_run_id      TEXT,
+    resolved_model_version  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_alerts_created ON drift_alerts (created_at);
@@ -94,6 +101,27 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+#: Columns added after the table was first created. SQLite has no
+#: ADD COLUMN IF NOT EXISTS, and CREATE TABLE IF NOT EXISTS silently leaves
+#: an older table untouched -- so a store written before resolution tracking
+#: existed would keep working and then fail on the first UPDATE.
+MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("drift_alerts", "resolved_at TEXT"),
+    ("drift_alerts", "resolved_by_run_id TEXT"),
+    ("drift_alerts", "resolved_model_version TEXT"),
+)
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    for table, column in MIGRATIONS:
+        name = column.split()[0]
+        existing = {
+            row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if existing and name not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+
+
 @contextmanager
 def connect(path: Path = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
     """Open the store, creating it and its schema if absent."""
@@ -104,6 +132,7 @@ def connect(path: Path = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
         # WAL so a reading monitor does not block a writing service.
         connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(SCHEMA)
+        _migrate(connection)
         yield connection
         connection.commit()
     finally:
@@ -177,19 +206,58 @@ def recent_alerts(limit: int = 10, path: Path = DEFAULT_DB_PATH) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def latest_retrain_trigger(path: Path = DEFAULT_DB_PATH) -> dict | None:
-    """Most recent alert that asked for a retrain.
+def latest_retrain_trigger(
+    path: Path = DEFAULT_DB_PATH, include_resolved: bool = False
+) -> dict | None:
+    """Most recent *unresolved* alert asking for a retrain, or None.
 
-    Phase 6's workflow reads this rather than re-deriving the decision, so
-    the thing that fires the retrain and the thing that recorded why are the
-    same row.
+    The retrain reads this rather than re-deriving the decision, so the row
+    that fires the retrain and the row that recorded why are the same one --
+    a retrain can always be traced back to the drift measurement that caused
+    it, months later, without recomputing anything.
+
+    Resolved alerts are excluded so a scheduled workflow cannot retrain
+    repeatedly on the same drift. ``retrain_triggered = 1`` is set only for
+    genuine value drift; a missingness-driven alert never has it, so this
+    query cannot return one.
+    """
+    query = "SELECT * FROM drift_alerts WHERE retrain_triggered = 1"
+    if not include_resolved:
+        query += " AND resolved_at IS NULL"
+    query += " ORDER BY id DESC LIMIT 1"
+    with connect(path) as connection:
+        row = connection.execute(query).fetchone()
+    return dict(row) if row else None
+
+
+def open_retrain_alerts(path: Path = DEFAULT_DB_PATH) -> list[dict]:
+    """Every unresolved retrain-triggering alert, oldest first."""
+    with connect(path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM drift_alerts WHERE retrain_triggered = 1 "
+            "AND resolved_at IS NULL ORDER BY id ASC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_resolved(
+    alert_id: int,
+    run_id: str | None = None,
+    model_version: str | None = None,
+    path: Path = DEFAULT_DB_PATH,
+) -> bool:
+    """Close an alert, recording which run answered it.
+
+    Returns False if the alert was already resolved, which is what makes
+    this safe to call from a workflow that might run twice.
     """
     with connect(path) as connection:
-        row = connection.execute(
-            "SELECT * FROM drift_alerts WHERE retrain_triggered = 1 "
-            "ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-    return dict(row) if row else None
+        cursor = connection.execute(
+            "UPDATE drift_alerts SET resolved_at = ?, resolved_by_run_id = ?, "
+            "resolved_model_version = ? WHERE id = ? AND resolved_at IS NULL",
+            (utc_now(), run_id, model_version, alert_id),
+        )
+        return cursor.rowcount > 0
 
 
 # --------------------------------------------------------------------------

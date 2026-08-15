@@ -1,0 +1,169 @@
+# Drift-triggered retraining.
+#
+# READ THIS BEFORE ENABLING THE SCHEDULE.
+#
+# This workflow cannot run on a GitHub-hosted runner. Nothing it needs is in
+# the repository:
+#
+#   data/splits/*.parquet   78 MB, gitignored, DVC-tracked with no remote
+#   mlflow.db               the tracking store and registry, gitignored
+#   mlartifacts/            6.2 MB of model binaries, gitignored
+#   reports/drift.db        the alert store the trigger is read from
+#
+# A hosted runner would check out the code and find none of it. The preflight
+# job below detects exactly that and fails with the reason rather than a
+# traceback forty lines into training.
+#
+# It runs correctly on a SELF-HOSTED runner on the machine that holds the
+# data and the MLflow store. See docs/retraining.md for what a real
+# deployment would need instead.
+
+name: retrain-on-drift
+
+on:
+  schedule:
+    # 02:00 UTC daily. GitHub's cron is best-effort and routinely runs
+    # 5-30 minutes late under load; nothing here depends on precise timing.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      window_days:
+        description: "Days of labelled history to retrain on"
+        required: false
+        default: "120"
+      force:
+        description: "Retrain even if no alert is open (diagnostics only)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  # Two retrains answering the same alert would register two challengers for
+  # one drift measurement.
+  group: fraudshield-retrain
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    # self-hosted: a GitHub-hosted runner has no data, no registry and no
+    # alert store. Swap to ubuntu-latest only once those live somewhere a
+    # hosted runner can reach -- see docs/retraining.md.
+    runs-on: [self-hosted]
+    outputs:
+      should_retrain: ${{ steps.check.outputs.should_retrain }}
+      alert_id: ${{ steps.check.outputs.alert_id }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the prerequisites exist on this runner
+        shell: bash
+        run: |
+          missing=0
+          for p in data/splits/train.parquet data/splits/stream.parquet \
+                   mlflow.db reports/drift.db; do
+            if [ ! -e "$p" ]; then echo "MISSING  $p"; missing=1; else echo "present  $p"; fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo ""
+            echo "This runner cannot retrain: the data, the MLflow store or the"
+            echo "alert database is not present. A GitHub-hosted runner will"
+            echo "always fail here -- none of these are in git. Use a"
+            echo "self-hosted runner on the machine that holds them, or move"
+            echo "them somewhere reachable (see docs/retraining.md)."
+            exit 1
+          fi
+
+      - name: Is a retrain due?
+        id: check
+        shell: bash
+        run: |
+          # --check-only exits 0 when an unresolved genuine-value-drift alert
+          # exists, 1 otherwise. Missingness-driven alerts never set
+          # retrain_triggered, so they cannot reach this branch.
+          if python -m src.training.retrain --check-only > check.txt 2>&1; then
+            echo "should_retrain=true" >> "$GITHUB_OUTPUT"
+            id=$(grep -oE 'alert #[0-9]+' check.txt | head -1 | tr -dc '0-9')
+            echo "alert_id=${id}" >> "$GITHUB_OUTPUT"
+            echo "reason=$(head -1 check.txt)" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.force }}" = "true" ]; then
+            echo "should_retrain=true" >> "$GITHUB_OUTPUT"
+            echo "reason=forced via workflow_dispatch" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_retrain=false" >> "$GITHUB_OUTPUT"
+            echo "reason=$(head -1 check.txt)" >> "$GITHUB_OUTPUT"
+          fi
+          cat check.txt
+
+  retrain:
+    needs: preflight
+    if: needs.preflight.outputs.should_retrain == 'true'
+    runs-on: [self-hosted]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm the data has not changed underneath us
+        shell: bash
+        run: |
+          # The .dvc pointers carry an md5 of each tracked directory, so a
+          # silently swapped dataset is visible here rather than inferred
+          # later from a moved metric.
+          python -m dvc status || true
+
+      - name: Retrain
+        shell: bash
+        env:
+          # Belt to the config's braces. XGBoost's hist method is not
+          # thread-deterministic, and a runner's core count differs from any
+          # development machine -- an unpinned retrain would produce a model
+          # differing for reasons unrelated to the drift, making the Phase 7
+          # shadow comparison uninterpretable. retrain.py also asserts the
+          # effective value on the fitted estimators and refuses to register
+          # if it does not match.
+          OMP_NUM_THREADS: "2"
+        run: |
+          python -m src.training.retrain \
+            --window-days "${{ inputs.window_days || '120' }}"
+
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          if [ -f reports/retrain_metrics.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("reports/retrain_metrics.json"))
+          reg, trig = r.get("registered") or {}, r["trigger"]
+          print("## Drift-triggered retrain\n")
+          print(f"Answered alert **#{trig['trigger.alert_id']}** "
+                f"({trig['trigger.verdict']})\n")
+          print(f"- triggering PSI **{trig['trigger.value_drift_psi']:.4f}** on "
+                f"`{trig['trigger.overall_psi_feature']}`")
+          print(f"- drifting features: `{trig['trigger.drifting_features']}`")
+          print(f"- window: {r['window']['label']}, {r['window']['fit_rows']:,} fit rows")
+          print(f"- n_jobs: **{r['n_jobs']}** (pinned and asserted)\n")
+          print("| model | eval PR-AUC | ROC-AUC | gap | trees |")
+          print("|---|---|---|---|---|")
+          for name, b in r["models"].items():
+              trees = b["n_trees_used"] or "-"
+              print(f"| {name} | {b['val']['pr_auc']:.4f} | {b['val']['roc_auc']:.4f} "
+                    f"| {b['overfit_gap_pr_auc']:+.4f} | {trees} |")
+          if reg:
+              print(f"\nRegistered **{reg['name']} v{reg['version']}** to "
+                    f"**{reg['stage']}** — a challenger, not a promotion. "
+                    "The shadow A/B decides.")
+          PY
+          else
+            echo "Retrain produced no metrics file." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the run record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrain-metrics
+          path: |
+            reports/retrain_metrics.json
+            reports/drift_decision.json
+          if-no-files-found: warn

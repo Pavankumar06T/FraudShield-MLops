@@ -231,22 +231,107 @@ def test_promotion_history_is_empty_not_broken_without_the_table(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_the_data_layer_does_not_import_the_psi_implementation():
-    """A dashboard that could compute PSI would eventually compute it
-    differently from the monitor."""
-    source = Path("src/dashboard/data.py").read_text(encoding="utf-8")
-    for forbidden in ("psi_numeric", "psi_categorical", "compute_psi_report",
-                      "average_precision_score", "paired_bootstrap"):
-        assert forbidden not in source, (
-            f"{forbidden!r} in the dashboard means it can produce a number that "
-            "disagrees with the tool that owns it"
-        )
+#: Anything that could let a page produce a number of its own, rather than
+#: display one the monitor or the comparison already committed to.
+FORBIDDEN = frozenset({
+    "psi_numeric",
+    "psi_categorical",
+    "compute_psi_report",
+    "decompose_drift",
+    "average_precision_score",
+    "paired_bootstrap",
+    "roc_auc_score",
+})
 
 
-def test_the_app_does_not_import_the_psi_implementation():
-    source = Path("src/dashboard/app.py").read_text(encoding="utf-8")
-    for forbidden in ("psi_numeric", "compute_psi_report", "average_precision_score"):
-        assert forbidden not in source
+def dashboard_modules() -> list[Path]:
+    """Every module under src/dashboard, pages included."""
+    found = sorted(Path("src/dashboard").rglob("*.py"))
+    assert found, "no dashboard modules found"
+    return found
+
+
+def referenced_names(source: str) -> set[str]:
+    """Names a module actually imports or calls.
+
+    Parsed rather than grepped. A substring search would flag a docstring
+    that *names* a metric while explaining it -- which is exactly what the
+    Methodology page is for -- so the check has to distinguish describing a
+    function from reaching for one.
+    """
+    import ast
+
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            names.update(alias.name for alias in node.names)
+            names.update(alias.asname for alias in node.names if alias.asname)
+        elif isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[-1] for alias in node.names)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+    return names
+
+
+@pytest.mark.parametrize("module", dashboard_modules(), ids=lambda p: p.name)
+def test_no_dashboard_module_can_recompute_what_it_displays(module):
+    """Parametrised over the whole package rather than two named files, so a
+    new page cannot quietly reintroduce a second implementation.
+
+    A page that recomputed PSI would eventually disagree with the monitor
+    that fired the alert, and a reader would be looking at a number nobody
+    can reconcile with the decision actually taken.
+    """
+    used = referenced_names(module.read_text(encoding="utf-8")) & FORBIDDEN
+    assert not used, (
+        f"{module} references {sorted(used)} -- the dashboard could then "
+        "produce a number that disagrees with the tool that owns it"
+    )
+
+
+def test_the_methodology_page_explains_rather_than_computes():
+    """Its worked examples must be hardcoded real values. Live computation
+    there would be the same failure wearing an explanation."""
+    source = Path("src/dashboard/pages/methodology.py").read_text(encoding="utf-8")
+    assert not (referenced_names(source) & FORBIDDEN)
+    # nor may it reach the stores -- with no inputs there is nothing to drift
+    assert "from src.dashboard import data" not in source
+    assert "src.drift.store" not in source
+
+
+def test_the_check_would_catch_a_real_reintroduction():
+    """Guards the guard: prose naming a metric is fine, importing one is not."""
+    prose = (
+        '"""We compute average_precision_score elsewhere."""' + chr(10) + "x = 1"
+    )
+    assert not (referenced_names(prose) & FORBIDDEN)
+
+    real = "from sklearn.metrics import average_precision_score"
+    assert referenced_names(real) & FORBIDDEN == {"average_precision_score"}
+
+
+def test_the_methodology_page_carries_the_real_worked_examples():
+    """The numbers that make it legible: if they are absent the page is
+    explaining something other than this system."""
+    source = Path("src/dashboard/pages/methodology.py").read_text(encoding="utf-8")
+    for value in ("0.5490", "0.0010", "74.6%", "38.8%",     # M9 decomposition
+                  "2.2655", "8.4030",                        # id_31
+                  "0.0393", "13.3x",                         # PR-AUC floor
+                  "0.8018", "0.8032",                        # thresholds
+                  "0.9778", "0.0023", "0.0080",              # bootstrap / one-SE
+                  "0.2492", "20.13", "100.0%",               # v3 leakage
+                  "0.0327", "4.81", "20,000"):               # corrected promotion
+        assert value in source, f"methodology is missing the worked value {value}"
+
+
+def test_every_navigable_page_exists():
+    app = Path("src/dashboard/app.py").read_text(encoding="utf-8")
+    for page in ("overview", "drift", "serving", "model", "promotions",
+                 "methodology"):
+        assert f'"{page}.py"' in app, f"{page} is not in the navigation"
+        assert Path(f"src/dashboard/pages/{page}.py").exists()
 
 
 # --------------------------------------------------------------------------

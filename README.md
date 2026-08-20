@@ -812,3 +812,10 @@ For an Instant answer : python -c "import pandas as pd; d=pd.read_csv('reports/p
 
 How do you know the versions:
 pytest -q
+
+On showing PSI live in the terminal:
+python -c "import pandas as pd; d=pd.read_csv('reports/psi_report.csv',index_col=0); print(d.head(15))"
+
+Live : python -m src.drift.report
+
+

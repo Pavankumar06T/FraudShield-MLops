@@ -483,3 +483,88 @@ def test_threshold_falls_back_loudly_when_the_run_has_none():
 
     threshold, source = resolve_threshold(_Client({}), _Version(), "champion")
     assert "FALLBACK" in source
+
+
+# --------------------------------------------------------------------------
+# A registered model must never be served against another run's encoders
+# --------------------------------------------------------------------------
+
+
+class _Artifacts:
+    """Stands in for mlflow.artifacts, with a download that always fails."""
+
+    @staticmethod
+    def download_artifacts(run_id=None, artifact_path=None):
+        raise RuntimeError("no such artifact")
+
+
+class _Mlflow:
+    artifacts = _Artifacts()
+
+
+def test_missing_encoders_raise_rather_than_falling_back(monkeypatch):
+    """The failure that survived a promotion. Serving fell back to whatever
+    encoders.pkl was on disk, every prediction computed, and nothing
+    downstream could tell the codes meant something else."""
+    from src.serving.predictor import EncoderResolutionError, _load_encoders_for_run
+
+    monkeypatch.delenv("FRAUDSHIELD_ALLOW_ENCODER_FALLBACK", raising=False)
+    with pytest.raises(EncoderResolutionError):
+        _load_encoders_for_run(_Mlflow(), "deadbeef", version="7")
+
+
+def test_the_error_names_the_version_the_run_and_the_fix(monkeypatch):
+    from src.serving.predictor import EncoderResolutionError, _load_encoders_for_run
+
+    monkeypatch.delenv("FRAUDSHIELD_ALLOW_ENCODER_FALLBACK", raising=False)
+    with pytest.raises(EncoderResolutionError) as caught:
+        _load_encoders_for_run(_Mlflow(), "deadbeef", version="7")
+
+    message = str(caught.value)
+    assert "version 7" in message
+    assert "deadbeef" in message
+    assert "FRAUDSHIELD_ALLOW_ENCODER_FALLBACK" in message
+    assert "vocabulary it never saw" in message
+
+
+def test_a_version_with_no_run_id_also_raises(monkeypatch):
+    from src.serving.predictor import EncoderResolutionError, _load_encoders_for_run
+
+    monkeypatch.delenv("FRAUDSHIELD_ALLOW_ENCODER_FALLBACK", raising=False)
+    with pytest.raises(EncoderResolutionError, match="no run id"):
+        _load_encoders_for_run(_Mlflow(), None, version="7")
+
+
+def test_fallback_survives_only_behind_an_explicit_opt_in(monkeypatch):
+    """Reasonable in development, never implicit."""
+    from src.serving.predictor import _load_encoders_for_run
+
+    monkeypatch.setenv("FRAUDSHIELD_ALLOW_ENCODER_FALLBACK", "1")
+    _, source = _load_encoders_for_run(_Mlflow(), "deadbeef", version="7")
+    assert "FALLBACK" in source
+    assert "FRAUDSHIELD_ALLOW_ENCODER_FALLBACK is set" in source
+
+
+def test_the_opt_in_is_off_by_default(monkeypatch):
+    from src.serving.predictor import fallback_allowed
+
+    monkeypatch.delenv("FRAUDSHIELD_ALLOW_ENCODER_FALLBACK", raising=False)
+    assert fallback_allowed() is False
+    for truthy in ("1", "true", "YES"):
+        monkeypatch.setenv("FRAUDSHIELD_ALLOW_ENCODER_FALLBACK", truthy)
+        assert fallback_allowed() is True
+    monkeypatch.setenv("FRAUDSHIELD_ALLOW_ENCODER_FALLBACK", "0")
+    assert fallback_allowed() is False
+
+
+def test_an_absent_challenger_is_still_not_an_error(monkeypatch):
+    """A registry with no candidate is the normal state. try_load_bundle must
+    return None rather than propagating -- shadow scoring is optional, a real
+    decision is not."""
+    import src.serving.predictor as predictor
+
+    def boom(*a, **k):
+        raise predictor.EncoderResolutionError("no encoders")
+
+    monkeypatch.setattr(predictor, "load_bundle", boom)
+    assert predictor.try_load_bundle("challenger") is None

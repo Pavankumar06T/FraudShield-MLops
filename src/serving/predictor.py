@@ -30,6 +30,7 @@ Three things this path gets right that a reimplementation would likely miss:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -127,23 +128,66 @@ def load_threshold(alias: str = CHAMPION_ALIAS) -> tuple[float, str]:
     return DEFAULT_THRESHOLD, f"default 0.5 -- {path.name} missing or unreadable"
 
 
-def _load_encoders_for_run(mlflow, run_id: str | None) -> tuple[FeatureEncoders, str]:
-    """Prefer the encoders logged beside the registered model.
+class EncoderResolutionError(RuntimeError):
+    """A registered model's own encoders could not be resolved."""
 
-    Falling back to the local file is a convenience for development, and a
-    real risk in production: a local encoders.pkl can come from a different
-    training run than the registered model, and the mismatch is silent --
-    the codes simply mean something else.
+
+#: Escape hatch for development, off by default and deliberately awkward to
+#: set. Serving a registered model against another run's encoders is a
+#: production incident, not a warning.
+ALLOW_FALLBACK_ENV: str = "FRAUDSHIELD_ALLOW_ENCODER_FALLBACK"
+
+
+def fallback_allowed() -> bool:
+    return os.environ.get(ALLOW_FALLBACK_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _load_encoders_for_run(
+    mlflow,
+    run_id: str | None,
+    version: str | None = None,
+    allow_fallback: bool | None = None,
+) -> tuple[FeatureEncoders, str]:
+    """The encoders belonging to THIS model version, or an exception.
+
+    Falling back to ``models/encoders.pkl`` is not a degraded mode; it is a
+    different model's vocabulary. Measured between two runs of this project,
+    five of thirty-one categorical columns assigned different codes to the
+    same level -- 970 ``DeviceInfo`` levels, 49 in ``id_31`` -- and 57 of 400
+    predictions changed, by up to 0.2502. Every prediction still computes,
+    which is exactly why this must raise rather than warn: nothing
+    downstream can tell that the codes mean something else.
+
+    The fallback survives only for development, behind an explicit
+    environment variable, and says so in the source it reports.
     """
+    reason = "the version carries no run id"
     if run_id is not None:
         try:
             path = mlflow.artifacts.download_artifacts(
                 run_id=run_id, artifact_path=ENCODERS_PATH.name
             )
             return FeatureEncoders.load(Path(path)), f"mlflow run {run_id[:8]}"
-        except Exception:
-            pass
-    return FeatureEncoders.load(ENCODERS_PATH), f"local {ENCODERS_PATH.name} (FALLBACK)"
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+
+    permitted = fallback_allowed() if allow_fallback is None else allow_fallback
+    if not permitted:
+        raise EncoderResolutionError(
+            f"Model version {version or '?'} (run {run_id or '?'}) has no "
+            f"{ENCODERS_PATH.name} logged, so its own encoders cannot be "
+            f"resolved: {reason}.\n"
+            f"Refusing to serve it against {ENCODERS_PATH}, which belongs to "
+            "whichever run wrote it last. A model scored with another run's "
+            "encoders produces predictions from a vocabulary it never saw, "
+            "and nothing downstream can detect it.\n"
+            "Fix by logging the encoders onto that run, or set "
+            f"{ALLOW_FALLBACK_ENV}=1 to accept the risk in development."
+        )
+    return (
+        FeatureEncoders.load(ENCODERS_PATH),
+        f"local {ENCODERS_PATH.name} (FALLBACK -- {ALLOW_FALLBACK_ENV} is set)",
+    )
 
 
 def resolve_alias(client, name: str, aliases: tuple[str, ...]):
@@ -212,7 +256,9 @@ def load_bundle(model_name: str | None = None, alias: str = MODEL_ALIAS) -> Mode
     best = getattr(model, "best_iteration", None)
     n_trees = int(best) + 1 if best is not None else booster.num_boosted_rounds()
 
-    encoders, encoder_source = _load_encoders_for_run(mlflow, version.run_id)
+    encoders, encoder_source = _load_encoders_for_run(
+        mlflow, version.run_id, version=version.version
+    )
     threshold, threshold_source = resolve_threshold(client, version, alias)
 
     bundle = ModelBundle(

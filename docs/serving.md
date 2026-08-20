@@ -15,6 +15,41 @@ model. A model served against encoders from a different run fails silently:
 the ordinal codes simply mean something else, and every prediction is
 quietly wrong.
 
+## A registered model is served with its own encoders, or not at all
+
+`load_bundle` resolves encoders from the MLflow run behind the registered
+version. If that run has none, it **raises** — it does not fall back to
+`models/encoders.pkl`.
+
+That file belongs to whichever run wrote it last. Measured between two runs
+of this project, five of thirty-one categorical columns assigned different
+codes to the same level — 970 `DeviceInfo` levels and 49 in `id_31`, the
+feature whose drift triggered the retrain — and 57 of 400 predictions
+changed, by up to 0.2502.
+
+Every prediction still computes. That is precisely why it must raise: nothing
+downstream can tell the codes mean something else. This failure survived a
+full promotion cycle, and was caught only by someone reading `(FALLBACK)` in
+a startup log.
+
+```
+EncoderResolutionError: Model version 2 (run 5894f0e9...) has no encoders.pkl
+logged, so its own encoders cannot be resolved: ...
+Refusing to serve it against models/encoders.pkl, which belongs to whichever
+run wrote it last. ...
+Fix by logging the encoders onto that run, or set
+FRAUDSHIELD_ALLOW_ENCODER_FALLBACK=1 to accept the risk in development.
+```
+
+The escape hatch exists for development and is off by default. An absent
+*challenger* is still not an error — `try_load_bundle` returns None, because
+shadow scoring is optional and a real decision is not.
+
+The same rule now applies to the threshold: `resolve_threshold` reads it from
+the version's own run rather than from a file keyed by role. Resolving by role
+meant the operating point followed the alias, so promoting a challenger
+silently swapped its 0.8032 for the baseline's 0.8018.
+
 ## Latency, measured
 
 On the promoted 799-tree model, 431 features, single transaction:

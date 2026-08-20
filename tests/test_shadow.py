@@ -412,3 +412,74 @@ def test_leakage_outranks_every_other_verdict():
     the rows are compromised."""
     result = leaky(delta=-0.5, se=0.001)   # decisively worse, and leaked
     assert result.verdict.startswith("NO VERDICT")
+
+
+# --------------------------------------------------------------------------
+# Artifacts must belong to the model that is serving them
+# --------------------------------------------------------------------------
+
+
+def test_retrain_logs_its_encoders_as_an_artifact():
+    """A retrained model fits its own encoders on its own window. Logging
+    none meant serving silently fell back to whatever encoders.pkl was on
+    disk -- which belonged to a different run, and remapped 970 DeviceInfo
+    levels and 49 in id_31."""
+    from pathlib import Path
+
+    source = Path("src/training/retrain.py").read_text(encoding="utf-8")
+    assert "artifacts=[]," not in source, "the retrain logged no artifacts"
+    assert "encoders.save(CHALLENGER_ENCODERS_PATH)" in source
+    assert "artifacts=[staged, RETRAIN_REPORT_PATH]" in source
+
+
+def test_encoders_are_staged_under_the_name_serving_looks_for():
+    """Artifacts are logged by filename. Logging them as
+    challenger_encoders.pkl would leave the download looking for
+    encoders.pkl and falling back exactly as before."""
+    from pathlib import Path
+
+    source = Path("src/training/retrain.py").read_text(encoding="utf-8")
+    assert "staged = Path(tempfile.mkdtemp()) / ENCODERS_PATH.name" in source
+
+
+def test_threshold_is_resolved_per_version_not_per_role():
+    """Resolving by role made the threshold follow the alias rather than the
+    model: promoting v4 swapped its 0.8032 for the baseline's 0.8018, so a
+    model measured at one operating point began deciding at another."""
+    from pathlib import Path
+
+    source = Path("src/serving/predictor.py").read_text(encoding="utf-8")
+    assert "def resolve_threshold(" in source
+    assert "resolve_threshold(client, version, alias)" in source
+    assert "val.at_best_f1_threshold.threshold" in source
+
+
+class _Version:
+    def __init__(self, run_id="abc12345", version="4"):
+        self.run_id, self.version = run_id, version
+
+
+class _Client:
+    def __init__(self, metrics):
+        self._metrics = metrics
+
+    def get_run(self, run_id):
+        return type("R", (), {"data": type("D", (), {"metrics": self._metrics})})
+
+
+def test_threshold_comes_from_the_versions_own_run():
+    from src.serving.predictor import resolve_threshold
+
+    client = _Client({"val.at_best_f1_threshold.threshold": 0.8032})
+    threshold, source = resolve_threshold(client, _Version(), "champion")
+    assert threshold == pytest.approx(0.8032)
+    assert "abc12345" in source and "v4" in source
+
+
+def test_threshold_falls_back_loudly_when_the_run_has_none():
+    """Absent a run metric the role-keyed file is used, but the source says
+    so rather than presenting it as the model's own."""
+    from src.serving.predictor import resolve_threshold
+
+    threshold, source = resolve_threshold(_Client({}), _Version(), "champion")
+    assert "FALLBACK" in source

@@ -166,7 +166,7 @@ not an A/B test.
 |---|---|---|---|---|---|
 | **v2** | rejected | −0.0100 | — | 25,000 | behind the champion on merit |
 | **v3** | rolled back | +0.2492 | 20.13 SE | 25,000 | **100% training-window overlap** |
-| **v4** | **promoted** | **+0.0361** | **4.23 SE** | 11,429 | ahead beyond noise, zero overlap |
+| **v4** | **promoted** | **+0.0327** | **4.81 SE** | 20,000 | ahead beyond noise, zero overlap |
 
 **v2** trained on a 30-day window (61,723 fit rows) and lost honestly. Its
 verdict is recorded on the model version; it is Archived, not deleted.
@@ -184,19 +184,27 @@ had seen. Leakage check: **0.0%**.
 
 ```
                     champion   challenger      delta
-  PR-AUC              0.5299       0.5661    +0.0361
-  precision           0.5521       0.6022    +0.0501
-  recall              0.4441       0.4693    +0.0251
-  false negatives        199          190         -9
-  flagged                288          279         -9
+  PR-AUC              0.4942       0.5270    +0.0327
+  precision           0.5300       0.5905    +0.0605
+  recall              0.4069       0.4300    +0.0231
+  false negatives        360          346        -14
+  flagged                466          442        -24
 
-  bootstrap std error  0.0085    95% CI [+0.0192, +0.0532]
-  margin               4.23 SE   (need 1.00)
+  bootstrap std error  0.0068    95% CI [+0.0204, +0.0467]
+  margin               4.81 SE   (need 1.00)
 ```
 
-It catches 9 more frauds while raising 9 *fewer* flags — better on both sides,
-not a threshold trade. That shape is what an honest comparison produces; a
-leaked one does not.
+It catches 14 more frauds while raising 24 *fewer* flags — better on both
+sides, not a threshold trade. That shape is what an honest comparison
+produces; a leaked one does not.
+
+This is the *second* comparison of v4. The first reported +0.0361 at 4.23 SE
+and was withdrawn: the challenger had been scored with the baseline's
+encoders, because `retrain.py` logged no artifacts and serving fell back to
+whatever `encoders.pkl` was on disk. Five of thirty-one categorical columns
+assign different codes between the two runs, including 970 `DeviceInfo`
+levels and 49 in `id_31` — the feature whose drift triggered the retrain.
+The conclusion survived re-measurement; the number moved.
 
 **The leakage guard has fired twice, both on mistakes actually made** — once on
 the promotion above, and again minutes later when a fresh consumer group
@@ -782,3 +790,25 @@ docs/
   retraining.md           what a real deployment needs
   dashboard.md            why rejections go missing from promotion histories
 ```
+
+Run all these:
+
+cd "E:\FraudShield MLOps\fraudshield"
+.\.venv\Scripts\Activate.ps1
+$env:FRAUDSHIELD_DATA = "E:\FraudShield MLOps\fraudshield\data"
+
+python -m streamlit run src/dashboard/app.py
+
+uvicorn src.serving.app:app --port 8080
+
+pytest -q
+
+FOR DATA: python -m src.common.config
+
+For How does drift detection work / show me the numbers:
+python -m src.drift.report
+
+For an Instant answer : python -c "import pandas as pd; d=pd.read_csv('reports/psi_report.csv',index_col=0); print(d.head(15))"
+
+How do you know the versions:
+pytest -q

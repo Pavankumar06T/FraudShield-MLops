@@ -156,6 +156,29 @@ def resolve_alias(client, name: str, aliases: tuple[str, ...]):
     return None, None
 
 
+def resolve_threshold(client, version, alias: str) -> tuple[float, str]:
+    """The operating point belonging to THIS model version.
+
+    Read from the version's own MLflow run, not from a file chosen by role.
+    Resolving by role means the threshold follows the alias rather than the
+    model: promoting a challenger silently swapped its 0.8032 for the
+    baseline's 0.8018, so a model that had been measured at one operating
+    point began deciding at another the moment it was promoted.
+
+    Falls back to the role-keyed file only when the run carries no threshold
+    metric, and says which happened.
+    """
+    try:
+        metrics = client.get_run(version.run_id).data.metrics
+        value = metrics.get("val.at_best_f1_threshold.threshold")
+        if value is not None:
+            return float(value), f"run {version.run_id[:8]} (v{version.version})"
+    except Exception:
+        pass
+    threshold, source = load_threshold(alias)
+    return threshold, f"{source} (FALLBACK -- run carried no threshold metric)"
+
+
 def load_bundle(model_name: str | None = None, alias: str = MODEL_ALIAS) -> ModelBundle:
     """Resolve a registered model and its encoders.
 
@@ -190,7 +213,7 @@ def load_bundle(model_name: str | None = None, alias: str = MODEL_ALIAS) -> Mode
     n_trees = int(best) + 1 if best is not None else booster.num_boosted_rounds()
 
     encoders, encoder_source = _load_encoders_for_run(mlflow, version.run_id)
-    threshold, threshold_source = load_threshold(alias)
+    threshold, threshold_source = resolve_threshold(client, version, alias)
 
     bundle = ModelBundle(
         booster=booster,

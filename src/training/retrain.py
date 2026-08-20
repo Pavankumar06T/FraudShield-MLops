@@ -48,6 +48,7 @@ import numpy as np
 import pandas as pd
 
 from src.common.config import (
+    MODELS_DIR,
     REPORTS_DIR,
     STREAM_PARQUET,
     TRAIN_PARQUET,
@@ -55,7 +56,7 @@ from src.common.config import (
     ensure_dirs,
 )
 from src.drift import store
-from src.features.build_features import build_features
+from src.features.build_features import ENCODERS_PATH, build_features
 from src.training import tracking
 from src.training.train import (
     EARLY_STOPPING_ROUNDS,
@@ -92,6 +93,17 @@ EVAL_FRACTION: float = 0.15
 SECONDS_PER_DAY: int = 86_400
 
 RETRAIN_REPORT_PATH: Path = REPORTS_DIR / "retrain_metrics.json"
+
+#: Where a retrain writes the encoders it fitted.
+#:
+#: A retrained model fits its own encoders on its own window, and those
+#: codes are not the baseline's: measured across v1 and v4, five of the
+#: thirty-one categorical columns assign different codes to the same
+#: level, including 970 DeviceInfo levels and 49 in id_31 -- the feature
+#: whose drift triggered the retrain. Serving a model against another
+#: run's encoders is silent: every prediction is computed, and some are
+#: computed from a vocabulary the model never saw.
+CHALLENGER_ENCODERS_PATH: Path = MODELS_DIR / "challenger_encoders.pkl"
 
 #: Never Production. A challenger is not a promotion.
 TARGET_STAGE: str = "Staging"
@@ -429,12 +441,23 @@ def retrain(
         **environment_params(N_JOBS),
     }
 
+    # Persist the encoders BEFORE logging so they travel with the run.
+    # Written under the exact name the serving layer looks for: artifacts
+    # are logged by filename, and a mismatch there produces the same
+    # silent fallback as not logging them at all.
+    import shutil
+    import tempfile
+
+    encoders.save(CHALLENGER_ENCODERS_PATH)
+    staged = Path(tempfile.mkdtemp()) / ENCODERS_PATH.name
+    shutil.copy2(CHALLENGER_ENCODERS_PATH, staged)
+
     print(f"\n{tracking.describe_store()}")
     run_ids = log_training_runs(
         blocks,
         {"xgboost": xgb_model, "lightgbm": lgb_model},
         shared,
-        artifacts=[],
+        artifacts=[staged, RETRAIN_REPORT_PATH],
     )
     for name, run_id in run_ids.items():
         print(f"  logged {name:<9} run {run_id}")
